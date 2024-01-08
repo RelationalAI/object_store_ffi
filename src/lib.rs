@@ -126,7 +126,7 @@ unsafe impl Sync for AzureCredentials {}
 pub struct Response {
     result: CResult,
     length: usize,
-    error_message: *mut i8,
+    error_message: *mut c_char,
 }
 
 unsafe impl Send for Response {}
