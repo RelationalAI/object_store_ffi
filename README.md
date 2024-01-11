@@ -19,3 +19,33 @@ Whenever a new release of object_store_ffi is made, we should build binaries and
 This is done by making a pull request to [Yggdrasil](https://github.com/JuliaPackaging/Yggdrasil) to update [the object_store_ffi build recipe](https://github.com/JuliaPackaging/Yggdrasil/blob/master/O/object_store_ffi/build_tarballs.jl).
 The PR should usually just update the `GitSource` commit hash to point to the new release, and to update the `version` number.
 Merging such a PR will automatically build the binaries for the supported platforms and publish them to the object_store_ffi_jll.jl repository as part of a new release of object_store_ffi_jll.jl.
+
+#### Local build with BinaryBuilder.jl
+
+If you want to try building object_store_ffi_jll.jl locally, this can be done using [BinaryBuilder.jl](https://github.com/JuliaPackaging/BinaryBuilder.jl).
+You will need a local copy of the object_store_ffi build recipe `build_tarballs.jl`, and a Julia environment with BinaryBuilder.jl installed.
+
+For example, clone Yggdrasil and navigate to the object_store_ffi directory:
+
+```sh
+$ git clone git@github.com:JuliaPackaging/Yggdrasil.git
+$ cd Yggdrasil/O/object_store_ffi/
+```
+
+Create a Julia environment with BinaryBuilder installed:
+
+```sh
+$ julia --project=build_env -e 'using Pkg; Pkg.add("BinaryBuilder")'
+```
+
+You can then run the `build_tarballs.jl` script:
+
+```julia
+$ julia --project=build_env build_tarballs.jl aarch64-apple-darwin --deploy=local --verbose --debug
+```
+
+See `build_tarballs.jl --help` for supported arguments.
+
+See the [BinaryBuilder documentation](https://docs.binarybuilder.org) for more details.
+
+_Note BinaryBuilder requires Docker if running on MacOS or Windows._
