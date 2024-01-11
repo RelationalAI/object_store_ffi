@@ -44,7 +44,7 @@ You can then run the `build_tarballs.jl` script:
 $ julia --project=build_env build_tarballs.jl aarch64-apple-darwin --deploy=local --verbose --debug
 ```
 
-See `build_tarballs.jl --help` for support arguments.
+See `build_tarballs.jl --help` for supported arguments.
 
 See the [BinaryBuilder documentation](https://docs.binarybuilder.org) for more details.
 
