@@ -19,8 +19,7 @@ use moka::future::Cache;
 // Our global variables needed by our library at runtime. Note that we follow Rust's
 // safety rules here by making them immutable with write-exactly-once semantics using
 // either Lazy or OnceCell.
-static RT: Lazy<Runtime> = Lazy::new(|| tokio::runtime::Runtime::new()
-        .expect("could not initialize tokio runtime"));
+static RT: OnceCell<Runtime> = OnceCell::new();
 // A channel (i.e., a queue) where the GET/PUT requests from Julia are placed and where
 // our dispatch task pulls requests.
 static SQ: OnceCell<async_channel::Sender<Request>> = OnceCell::new();
@@ -31,6 +30,14 @@ static CLIENTS: Lazy<Cache<u64, Arc<dyn ObjectStore>>> = Lazy::new(|| Cache::new
 // Contains configuration items that affect every request globally by default,
 // currently includes retry configuration.
 static CONFIG: OnceCell<GlobalConfigOptions> = OnceCell::new();
+
+fn runtime() -> &'static Runtime {
+    RT.get().expect("start was not called")
+}
+
+fn global_config() -> &'static GlobalConfigOptions {
+    CONFIG.get().expect("start was not called")
+}
 
 // The result type used for the API functions exposed to Julia. This is used for both
 // synchronous errors, e.g. our dispatch channel is full, and for async errors such
@@ -179,10 +186,10 @@ pub async fn dyn_connect(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>
     Ok(client)
 }
 
+#[derive(Default, Copy, Clone)]
 #[repr(C)]
 pub struct GlobalConfigOptions {
-    max_retries: usize,
-    retry_timeout_sec: u64,
+    n_threads: usize
 }
 
 // The type used to give Julia the result of an async request. It will be allocated
@@ -219,10 +226,23 @@ pub extern "C" fn start(config: GlobalConfigOptions) -> CResult {
     }
     tracing_subscriber::fmt::init();
 
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    rt_builder.enable_all();
+
+    let n_threads = global_config().n_threads;
+    if n_threads > 0 {
+        rt_builder.worker_threads(64.min(n_threads));
+    }
+
+    RT.set(
+        rt_builder.build()
+        .expect("failed to create tokio runtime")
+    ).expect("runtime was set before");
+
     // Creates our main dispatch task that takes Julia requests from the queue and does the
     // GET or PUT. Note the 'buffer_unordered' call at the end of the map block, which lets
     // requests in the queue be processed concurrently and in any order.
-    RT.spawn(async move {
+    runtime().spawn(async move {
         let (tx, rx) = async_channel::bounded(16 * 1024);
         SQ.set(tx).expect("runtime already started");
 
