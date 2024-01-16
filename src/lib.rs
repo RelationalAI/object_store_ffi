@@ -27,16 +27,15 @@ static SQ: OnceCell<async_channel::Sender<Request>> = OnceCell::new();
 // storage bucket/account, including authentication info. This caches them so we do
 // not need to pay the construction cost for each request.
 static CLIENTS: Lazy<Cache<u64, Arc<dyn ObjectStore>>> = Lazy::new(|| Cache::new(10));
-// Contains configuration items that affect every request globally by default,
-// currently includes retry configuration.
-static CONFIG: OnceCell<GlobalConfigOptions> = OnceCell::new();
+// Contains configuration items that are set during initialization and do not change.
+static STATIC_CONFIG: OnceCell<StaticConfig> = OnceCell::new();
 
 fn runtime() -> &'static Runtime {
     RT.get().expect("start was not called")
 }
 
-fn global_config() -> &'static GlobalConfigOptions {
-    CONFIG.get().expect("start was not called")
+fn static_config() -> &'static StaticConfig {
+    STATIC_CONFIG.get().expect("start was not called")
 }
 
 // The result type used for the API functions exposed to Julia. This is used for both
@@ -81,6 +80,10 @@ impl Notifier {
 
 unsafe impl Send for Notifier {}
 
+// This is used to configure all aspects of the underlying
+// object store client including credentials, request and client options.
+// It has a single field `config_string` that must be a JSON serialized
+// object with string keys and values.
 #[repr(C)]
 pub struct Config {
     config_string: *const c_char
@@ -133,10 +136,8 @@ pub async fn dyn_connect(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>
         let mut minio_host = url::Url::parse(&v)
             .map_err(|e| anyhow!("failed to parse minio_host: {}", e))?;
         minio_host.set_path("");
-        // std::env::set_var("AZURITE_BLOB_STORAGE_URL", azurite_host.as_str());
         map.insert("allow_http".into(), "true".into());
         map.insert("aws_endpoint".into(), minio_host.as_str().trim_end_matches('/').to_string());
-        tracing::warn!("aws endpoint: {}", map["aws_endpoint"]);
     }
 
     let mut retry_config = RetryConfig::default();
@@ -171,24 +172,13 @@ pub async fn dyn_connect(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>
         }
         _ => unimplemented!("unknown url scheme")
     };
-    // let (store, _) = object_store::parse_url_opts(&url, pairs)?;
-
-    // let client: Arc<dyn ObjectStore> = Arc::new(store);
-
-    // let ping_path: Path = "_this_file_does_not_exist".try_into().unwrap();
-    // match client.get(&ping_path).await {
-    //     Ok(_) | Err(object_store::Error::NotFound { .. }) => {},
-    //     Err(e) => {
-    //         return Err(anyhow!("failed to check store client connection: {}", e));
-    //     }
-    // }
 
     Ok(client)
 }
 
 #[derive(Default, Copy, Clone)]
 #[repr(C)]
-pub struct GlobalConfigOptions {
+pub struct StaticConfig {
     n_threads: usize
 }
 
@@ -219,8 +209,8 @@ impl Response {
 }
 
 #[no_mangle]
-pub extern "C" fn start(config: GlobalConfigOptions) -> CResult {
-    if let Err(_) = CONFIG.set(config) {
+pub extern "C" fn start(config: StaticConfig) -> CResult {
+    if let Err(_) = STATIC_CONFIG.set(config) {
         tracing::warn!("Tried to start() runtime multiple times!");
         return CResult::Error;
     }
@@ -229,7 +219,7 @@ pub extern "C" fn start(config: GlobalConfigOptions) -> CResult {
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
 
-    let n_threads = global_config().n_threads;
+    let n_threads = static_config().n_threads;
     if n_threads > 0 {
         rt_builder.worker_threads(64.min(n_threads));
     }
