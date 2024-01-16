@@ -1,12 +1,12 @@
 use futures_util::StreamExt;
 use object_store::RetryConfig;
-use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::{c_char, c_void};
 use std::sync::Arc;
+use std::time::Duration;
 use anyhow::anyhow;
 
 use std::collections::hash_map::DefaultHasher;
@@ -26,12 +26,16 @@ static SQ: OnceCell<async_channel::Sender<Request>> = OnceCell::new();
 // The ObjectStore objects contain the context for communicating with a particular
 // storage bucket/account, including authentication info. This caches them so we do
 // not need to pay the construction cost for each request.
-static CLIENTS: Lazy<Cache<u64, Arc<dyn ObjectStore>>> = Lazy::new(|| Cache::new(10));
+static CLIENTS: OnceCell<Cache<u64, Arc<dyn ObjectStore>>> = OnceCell::new();
 // Contains configuration items that are set during initialization and do not change.
 static STATIC_CONFIG: OnceCell<StaticConfig> = OnceCell::new();
 
 fn runtime() -> &'static Runtime {
     RT.get().expect("start was not called")
+}
+
+fn clients() -> &'static Cache<u64, Arc<dyn ObjectStore>> {
+    CLIENTS.get().expect("start was not called")
 }
 
 fn static_config() -> &'static StaticConfig {
@@ -176,10 +180,24 @@ pub async fn dyn_connect(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>
     Ok(client)
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct StaticConfig {
-    n_threads: usize
+    n_threads: usize,
+    cache_capacity: u64,
+    cache_ttl_secs: u64,
+    cache_tti_secs: u64,
+}
+
+impl Default for StaticConfig {
+    fn default() -> Self {
+        StaticConfig {
+            n_threads: 0,
+            cache_capacity: 20,
+            cache_ttl_secs: 30 * 60,
+            cache_tti_secs: 5 * 60
+        }
+    }
 }
 
 // The type used to give Julia the result of an async request. It will be allocated
@@ -221,13 +239,21 @@ pub extern "C" fn start(config: StaticConfig) -> CResult {
 
     let n_threads = static_config().n_threads;
     if n_threads > 0 {
-        rt_builder.worker_threads(64.min(n_threads));
+        rt_builder.worker_threads(n_threads);
     }
 
     RT.set(
         rt_builder.build()
         .expect("failed to create tokio runtime")
     ).expect("runtime was set before");
+
+    let cache = moka::future::CacheBuilder::new(static_config().cache_capacity)
+        .time_to_live(Duration::from_secs(static_config().cache_ttl_secs))
+        .time_to_idle(Duration::from_secs(static_config().cache_tti_secs))
+        .build();
+
+    CLIENTS.set(cache)
+        .expect("cache was set before");
 
     // Creates our main dispatch task that takes Julia requests from the queue and does the
     // GET or PUT. Note the 'buffer_unordered' call at the end of the map block, which lets
@@ -240,7 +266,7 @@ pub extern "C" fn start(config: StaticConfig) -> CResult {
             async {
                 match req {
                     Request::Get(p, slice, config, response, notifier) => {
-                        let client = match CLIENTS.try_get_with(config.get_hash(), dyn_connect(config)).await {
+                        let client = match clients().try_get_with(config.get_hash(), dyn_connect(config)).await {
                             Ok(client) => client,
                             Err(e) => {
                                 response.from_error(e);
@@ -290,7 +316,7 @@ pub extern "C" fn start(config: StaticConfig) -> CResult {
                         }
                     }
                     Request::Put(p, slice, config, response, notifier) => {
-                        let client = match CLIENTS.try_get_with(config.get_hash(), dyn_connect(config)).await {
+                        let client = match clients().try_get_with(config.get_hash(), dyn_connect(config)).await {
                             Ok(client) => client,
                             Err(e) => {
                                 response.from_error(e);
