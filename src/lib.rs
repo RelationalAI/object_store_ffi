@@ -1,7 +1,9 @@
 use futures_util::StreamExt;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
+use tokio::io::AsyncWriteExt;
 use tokio::runtime::Runtime;
+use std::error::Error;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::{c_char, c_void};
@@ -187,6 +189,9 @@ pub struct StaticConfig {
     cache_capacity: u64,
     cache_ttl_secs: u64,
     cache_tti_secs: u64,
+    multipart_put_threshold: u64,
+    multipart_get_threshold: u64,
+    multipart_get_part_size: u64,
 }
 
 impl Default for StaticConfig {
@@ -195,7 +200,10 @@ impl Default for StaticConfig {
             n_threads: 0,
             cache_capacity: 20,
             cache_ttl_secs: 30 * 60,
-            cache_tti_secs: 5 * 60
+            cache_tti_secs: 5 * 60,
+            multipart_put_threshold: 8 * 1024 * 1024,
+            multipart_get_threshold: 8 * 1024 * 1024,
+            multipart_get_part_size: 8 * 1024 * 1024
         }
     }
 }
@@ -224,6 +232,62 @@ impl Response {
         let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
         self.error_message = c_string.into_raw();
     }
+}
+
+async fn multipart_get(slice: &'static mut [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<usize, Box<dyn Error>> {
+    let part_size: usize = static_config().multipart_get_part_size as usize;
+    let result = client.head(&path).await?;
+    if result.size > slice.len() {
+        return Err("Supplied buffer was too small".into());
+    }
+
+    // If the object size happens to be smaller than part_size,
+    // then we will end up doing a single range get of the whole
+    // object.
+    let mut parts = result.size / part_size;
+    if result.size % part_size != 0 {
+        parts += 1;
+    }
+    let mut part_ranges = Vec::with_capacity(parts);
+    for i in 0..(parts-1) {
+        part_ranges.push((i*part_size)..((i+1)*part_size));
+    }
+    // Last part which handles sizes not divisible by part_size
+    part_ranges.push(((parts-1)*part_size)..result.size);
+
+    let result_vec = client.get_ranges(&path, &part_ranges).await?;
+    let accum = tokio::spawn(async move {
+        let mut accum: usize = 0;
+        for i in 0..result_vec.len() {
+            slice[accum..accum + result_vec[i].len()].copy_from_slice(&result_vec[i]);
+            accum += result_vec[i].len();
+        }
+        accum
+    }).await?;
+
+    return Ok(accum);
+}
+
+async fn multipart_put(slice: &'static [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<(), Box<dyn Error>> {
+    let (multipart_id, mut writer) = client.put_multipart(&path).await?;
+    match writer.write_all(slice).await {
+        Ok(_) => {
+            match writer.flush().await {
+                Ok(_) => {
+                    writer.shutdown().await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    client.abort_multipart(&path, &multipart_id).await?;
+                    return Err(Box::new(e));
+                }
+            }
+        }
+        Err(e) => {
+            client.abort_multipart(&path, &multipart_id).await?;
+            return Err(Box::new(e));
+        }
+    };
 }
 
 #[no_mangle]
@@ -274,6 +338,25 @@ pub extern "C" fn start(config: StaticConfig) -> CResult {
                                 return;
                             }
                         };
+
+                        // Multipart Get
+                        if slice.len() > static_config().multipart_get_threshold as usize {
+                            match multipart_get(slice, &p, &client).await {
+                                Ok(accum) => {
+                                    response.success(accum);
+                                    notifier.notify();
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("{}", e);
+                                    response.from_error(e);
+                                    notifier.notify();
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Single part Get
                         match client.get(&p).await {
                             Ok(result) => {
                                 let chunks = result.into_stream().collect::<Vec<_>>().await;
@@ -325,17 +408,34 @@ pub extern "C" fn start(config: StaticConfig) -> CResult {
                             }
                         };
                         let len = slice.len();
-                        match client.put(&p, slice.into()).await {
-                            Ok(_) => {
-                                response.success(len);
-                                notifier.notify();
-                                return;
+
+                        if len < static_config().multipart_put_threshold as usize {
+                            match client.put(&p, slice.into()).await {
+                                Ok(_) => {
+                                    response.success(len);
+                                    notifier.notify();
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("{}", e);
+                                    response.from_error(e);
+                                    notifier.notify();
+                                    return;
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!("{}", e);
-                                response.from_error(e);
-                                notifier.notify();
-                                return;
+                        } else {
+                            match multipart_put(slice, &p, &client).await {
+                                Ok(_) => {
+                                    response.success(len);
+                                    notifier.notify();
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("{}", e);
+                                    response.from_error(e);
+                                    notifier.notify();
+                                    return;
+                                }
                             }
                         }
                     }
