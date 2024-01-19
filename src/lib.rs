@@ -3,7 +3,6 @@ use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Runtime;
-use std::error::Error;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::{c_char, c_void};
@@ -234,11 +233,11 @@ impl Response {
     }
 }
 
-async fn multipart_get(slice: &'static mut [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<usize, Box<dyn Error>> {
+async fn multipart_get(slice: &'static mut [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<usize> {
     let part_size: usize = static_config().multipart_get_part_size as usize;
     let result = client.head(&path).await?;
     if result.size > slice.len() {
-        return Err("Supplied buffer was too small".into());
+        return Err(anyhow!("Supplied buffer was too small"));
     }
 
     // If the object size happens to be smaller than part_size,
@@ -256,19 +255,16 @@ async fn multipart_get(slice: &'static mut [u8], path: &Path, client: &dyn Objec
     part_ranges.push(((parts-1)*part_size)..result.size);
 
     let result_vec = client.get_ranges(&path, &part_ranges).await?;
-    let accum = tokio::spawn(async move {
-        let mut accum: usize = 0;
-        for i in 0..result_vec.len() {
-            slice[accum..accum + result_vec[i].len()].copy_from_slice(&result_vec[i]);
-            accum += result_vec[i].len();
-        }
-        accum
-    }).await?;
+    let mut accum: usize = 0;
+    for i in 0..result_vec.len() {
+        slice[accum..accum + result_vec[i].len()].copy_from_slice(&result_vec[i]);
+        accum += result_vec[i].len();
+    }
 
     return Ok(accum);
 }
 
-async fn multipart_put(slice: &'static [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<(), Box<dyn Error>> {
+async fn multipart_put(slice: &'static [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<()> {
     let (multipart_id, mut writer) = client.put_multipart(&path).await?;
     match writer.write_all(slice).await {
         Ok(_) => {
@@ -279,13 +275,13 @@ async fn multipart_put(slice: &'static [u8], path: &Path, client: &dyn ObjectSto
                 }
                 Err(e) => {
                     client.abort_multipart(&path, &multipart_id).await?;
-                    return Err(Box::new(e));
+                    return Err(e.into());
                 }
             }
         }
         Err(e) => {
             client.abort_multipart(&path, &multipart_id).await?;
-            return Err(Box::new(e));
+            return Err(e.into());
         }
     };
 }
