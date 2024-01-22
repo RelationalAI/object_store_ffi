@@ -1,3 +1,4 @@
+use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
@@ -626,6 +627,308 @@ pub extern "C" fn delete(
                     CResult::Error
                 }
             }
+        }
+        None => {
+            return CResult::Error;
+        }
+    }
+}
+
+// Any non-Copy fields of ListEntry must be properly destroyed on destroy_list_entries
+#[repr(C)]
+pub struct ListEntry {
+    location: *const c_char,
+    last_modified: u64,
+    size: u64,
+    e_tag: *const c_char,
+    version: *const c_char
+}
+
+#[repr(C)]
+pub struct ListResponse {
+    result: CResult,
+    entries: *const ListEntry,
+    entry_count: u64,
+    error_message: *mut c_char
+}
+
+unsafe impl Send for ListResponse {}
+
+impl ListResponse {
+    fn from_error(&mut self, error: impl std::fmt::Display) {
+        self.result = CResult::Error;
+        self.entries = std::ptr::null();
+        self.entry_count = 0;
+        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
+        self.error_message = c_string.into_raw();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn destroy_list_entries(
+    entries: *mut ListEntry,
+    entry_count: u64
+) -> CResult {
+    let boxed_slice = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(entries, entry_count as usize)) };
+    for entry in &*boxed_slice {
+        // Safety: must properly drop all allocated fields from ListEntry here
+        let _ = unsafe { CString::from_raw(entry.location.cast_mut()) };
+        if !entry.e_tag.is_null() {
+            let _ = unsafe { CString::from_raw(entry.e_tag.cast_mut()) };
+        }
+        if !entry.version.is_null() {
+            let _ = unsafe { CString::from_raw(entry.version.cast_mut()) };
+        }
+    }
+    CResult::Ok
+}
+
+impl From<object_store::ObjectMeta> for ListEntry {
+    fn from(meta: object_store::ObjectMeta) -> Self {
+        ListEntry {
+            location: CString::new(meta.location.to_string())
+                .expect("should not have nulls")
+                .into_raw(),
+            last_modified: meta.last_modified
+                .timestamp()
+                .try_into()
+                .expect("is positive"),
+            size: meta.size as u64,
+            e_tag: match meta.e_tag {
+                None => std::ptr::null(),
+                Some(s) => {
+                    CString::new(s)
+                        .expect("should not have nulls")
+                        .into_raw()
+                }
+            },
+            version: match meta.version {
+                None => std::ptr::null(),
+                Some(s) => {
+                    CString::new(s)
+                        .expect("should not have nulls")
+                        .into_raw()
+                }
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn list(
+    prefix: *const c_char,
+    config: *const Config,
+    response: *mut ListResponse,
+    handle: *const c_void
+) -> CResult {
+    let response = unsafe { &mut (*response) };
+    response.result = CResult::Uninitialized;
+    let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
+    let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
+    let config = unsafe { & (*config) };
+    let notifier = Notifier { handle };
+
+    match RT.get() {
+        Some(runtime) => {
+            runtime.spawn(async move {
+                let list_op = async move {
+                    let client = clients()
+                        .try_get_with(config.get_hash(), dyn_connect(config))
+                        .await
+                        .map_err(|e| anyhow!(e))?;
+
+                    let stream = client.list(Some(&prefix));
+
+                    let entries: Vec<_> = stream.collect().await;
+                    let entries = entries.into_iter().collect::<Result<Vec<_>, _>>()?;
+                    let entries_slice = entries.into_iter()
+                        .map(Into::into)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+
+                    let entry_count = entries_slice.len() as u64;
+                    let entries_ptr = entries_slice.as_ptr();
+                    std::mem::forget(entries_slice);
+
+                    Ok::<_, anyhow::Error>((entry_count, entries_ptr))
+                };
+
+                match list_op.await {
+                    Ok((entry_count, entries_ptr)) => {
+                        response.result = CResult::Ok;
+                        response.entry_count = entry_count;
+                        response.entries = entries_ptr;
+                        response.error_message = std::ptr::null_mut();
+                        notifier.notify();
+                    },
+                    Err(e) => {
+                        tracing::warn!("{}", e);
+                        response.from_error(e);
+                        notifier.notify();
+                    }
+                }
+            });
+            CResult::Ok
+        }
+        None => {
+            return CResult::Error;
+        }
+    }
+}
+
+pub struct StreamWrapper {
+    client: Arc<dyn ObjectStore>,
+    stream: Option<BoxStream<'static, Vec<Result<object_store::ObjectMeta, object_store::Error>>>>
+}
+
+#[no_mangle]
+pub extern "C" fn destroy_list_stream(
+    stream: *mut StreamWrapper
+) -> CResult {
+    let mut boxed = unsafe { Box::from_raw(stream) };
+    // Safety: Must drop the stream before the client here
+    drop(boxed.stream.take());
+    drop(boxed);
+    CResult::Ok
+}
+
+#[repr(C)]
+pub struct ListStreamResponse {
+    result: CResult,
+    stream: *mut StreamWrapper,
+    error_message: *mut c_char
+}
+
+unsafe impl Send for ListStreamResponse {}
+
+impl ListStreamResponse {
+    fn from_error(&mut self, error: impl std::fmt::Display) {
+        self.result = CResult::Error;
+        self.stream = std::ptr::null_mut();
+        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
+        self.error_message = c_string.into_raw();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn list_stream(
+    prefix: *const c_char,
+    config: *const Config,
+    response: *mut ListStreamResponse,
+    handle: *const c_void
+) -> CResult {
+    let response = unsafe { &mut (*response) };
+    response.result = CResult::Uninitialized;
+    let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
+    let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
+    let config = unsafe { & (*config) };
+    let notifier = Notifier { handle };
+
+    match RT.get() {
+        Some(runtime) => {
+            runtime.spawn(async move {
+                let list_op = async move {
+                    let client = clients()
+                        .try_get_with(config.get_hash(), dyn_connect(config))
+                        .await
+                        .map_err(|e| anyhow!(e))?;
+
+                    let mut wrapper = Box::new(StreamWrapper {
+                        client,
+                        stream: None
+                    });
+
+                    let stream = wrapper.client.list(Some(&prefix)).chunks(1000).boxed();
+
+                    // Safety: This is needed because the compiler cannot infer that the stream
+                    // will outlive the client. We ensure this happens
+                    // by droping the stream before droping the Arc on destroy_list_stream
+                    wrapper.stream = Some(unsafe { std::mem::transmute(stream) });
+
+                    Ok::<_, anyhow::Error>(wrapper)
+                };
+
+                match list_op.await {
+                    Ok(wrapper) => {
+                        response.result = CResult::Ok;
+                        response.stream = Box::into_raw(wrapper);
+                        response.error_message = std::ptr::null_mut();
+                        notifier.notify();
+                    },
+                    Err(e) => {
+                        tracing::warn!("{}", e);
+                        response.from_error(e);
+                        notifier.notify();
+                    }
+                }
+            });
+            CResult::Ok
+        }
+        None => {
+            return CResult::Error;
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn next_list_stream_chunk(
+    stream: *mut StreamWrapper,
+    response: *mut ListResponse,
+    handle: *const c_void
+) -> CResult {
+    let response = unsafe { &mut (*response) };
+    response.result = CResult::Uninitialized;
+    let notifier = Notifier { handle };
+    let wrapper = match unsafe { stream.as_mut() } {
+        Some(w) => w,
+        None => {
+            tracing::error!("null stream pointer");
+            return CResult::Error;
+        }
+    };
+
+    match RT.get() {
+        Some(runtime) => {
+            runtime.spawn(async move {
+                let list_op = async move {
+                    let stream_ref = wrapper.stream.as_mut().unwrap();
+                    let result = match stream_ref.next().await {
+                        Some(vec) => {
+                            let entries = vec.into_iter().collect::<Result<Vec<_>, _>>()?;
+                            let entries_slice = entries.into_iter()
+                                .map(Into::into)
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice();
+
+                            let entry_count = entries_slice.len() as u64;
+                            let entries_ptr = entries_slice.as_ptr();
+                            std::mem::forget(entries_slice);
+
+                            (entry_count, entries_ptr)
+                        }
+                        None => {
+                            (0, std::ptr::null())
+                        }
+                    };
+                    Ok::<_, anyhow::Error>(result)
+                };
+
+                match list_op.await {
+                    Ok((entry_count, entries_ptr)) => {
+                        response.result = CResult::Ok;
+                        response.entries = entries_ptr;
+                        response.entry_count = entry_count;
+                        response.error_message = std::ptr::null_mut();
+                        notifier.notify();
+                    },
+                    Err(e) => {
+                        tracing::warn!("{}", e);
+                        response.from_error(e);
+                        notifier.notify();
+                    }
+                }
+            });
+            CResult::Ok
         }
         None => {
             return CResult::Error;
