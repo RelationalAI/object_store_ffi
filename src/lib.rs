@@ -84,6 +84,7 @@ impl Notifier {
 }
 
 unsafe impl Send for Notifier {}
+unsafe impl Sync for Notifier {}
 
 // This is used to configure all aspects of the underlying
 // object store client including credentials, request and client options.
@@ -287,11 +288,25 @@ async fn multipart_put(slice: &'static [u8], path: &Path, client: &dyn ObjectSto
 }
 
 #[no_mangle]
-pub extern "C" fn start(config: StaticConfig) -> CResult {
+pub extern "C" fn start(
+    config: StaticConfig,
+    panic_cond_handle: *const c_void
+) -> CResult {
     if let Err(_) = STATIC_CONFIG.set(config) {
         tracing::warn!("Tried to start() runtime multiple times!");
         return CResult::Error;
     }
+
+    let panic_notifier = Notifier {
+        handle: panic_cond_handle
+    };
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        prev(info);
+        panic_notifier.notify();
+    }));
+
     tracing_subscriber::fmt::init();
 
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
@@ -515,4 +530,13 @@ pub extern "C" fn destroy_cstring(string: *mut c_char) -> CResult {
     let string = unsafe { std::ffi::CString::from_raw(string) };
     drop(string);
     CResult::Ok
+}
+
+// Only used to simulate a panic
+#[no_mangle]
+pub extern "C" fn _trigger_panic() -> CResult {
+    runtime().spawn(async move {
+        panic!("oops");
+    });
+    CResult::Error
 }
