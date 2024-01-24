@@ -12,8 +12,15 @@ The primary user of object_store_ffi is the Julia package [RustyObjectStore.jl](
 
 #### Releasing
 
-New releases of object_store_ffi are made via GitHub releases.
-Each release should increment the version number following [Semantic Versioning](https://semver.org/).
+New releases of object_store_ffi are made by creating and pushing a tag with the new version (format: `v[0-9]+.[0-9]+.[0-9]+`).
+This will dispatch a release workflow that will build the assets and create the GitHub Release.
+
+```bash
+git tag -a v0.3.0 -m "New Release"
+git push --tags
+```
+
+Each release should increment the version number following [Semantic Versioning](https://semver.org/) and should be kept in sync with the `version` field of `Cargo.toml`.
 
 Whenever a new release of object_store_ffi is made, we should build binaries and release a new version of object_store_ffi_jll.jl.
 This is done by making a pull request to [Yggdrasil](https://github.com/JuliaPackaging/Yggdrasil) to update [the object_store_ffi build recipe](https://github.com/JuliaPackaging/Yggdrasil/blob/master/O/object_store_ffi/build_tarballs.jl).
