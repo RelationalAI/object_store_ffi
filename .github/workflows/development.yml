@@ -6,7 +6,7 @@ on:
       - edited
       - synchronize
       - reopened
-  workflow_call:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -14,6 +14,8 @@ jobs:
     strategy:
       matrix:
         include:
+          # The targets should match the platforms on the package's Yggdrasil build recipe:
+          # https://github.com/JuliaPackaging/Yggdrasil/blob/e8a9f04d70652738c682407b9799ada044d24614/O/object_store_ffi/build_tarballs.jl#L20
           # 64-bit (x86)
           - build: linux-64-bit
             os: ubuntu-latest
@@ -24,8 +26,6 @@ jobs:
             os: macos-latest
             target: x86_64-apple-darwin
             prebuild: "true"
-              # brew update
-              # brew install protobuf
             command: cargo
           # 64-bit (ARM)
           - build: linux-arm
@@ -37,8 +37,6 @@ jobs:
             os: macos-latest
             target: aarch64-apple-darwin
             prebuild: "true"
-              # brew update
-              # brew install protobuf
             command: cargo
     steps:
       - uses: actions/checkout@v4
