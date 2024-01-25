@@ -61,7 +61,7 @@ jobs:
           if [[ "${{ matrix.build }}" =~ "macos" ]]; then
             cp "target/${{ matrix.target }}/release/libobject_store_ffi.dylib" "$DIRECTORY"
           else
-            cp "target/${{ matrix.target }}/release/liboject_store_ffi.so" "$DIRECTORY"
+            cp "target/${{ matrix.target }}/release/libobject_store_ffi.so" "$DIRECTORY"
           fi
           7z a "$DIRECTORY.zip" "$DIRECTORY"
           echo "path=$DIRECTORY.zip" >> $GITHUB_OUTPUT
