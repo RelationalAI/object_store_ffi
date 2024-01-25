@@ -192,6 +192,7 @@ pub struct StaticConfig {
     multipart_put_threshold: u64,
     multipart_get_threshold: u64,
     multipart_get_part_size: u64,
+    concurrency_limit: u32,
 }
 
 impl Default for StaticConfig {
@@ -203,7 +204,8 @@ impl Default for StaticConfig {
             cache_tti_secs: 5 * 60,
             multipart_put_threshold: 8 * 1024 * 1024,
             multipart_get_threshold: 8 * 1024 * 1024,
-            multipart_get_part_size: 8 * 1024 * 1024
+            multipart_get_part_size: 8 * 1024 * 1024,
+            concurrency_limit: 512
         }
     }
 }
@@ -322,11 +324,15 @@ pub extern "C" fn start(
         .expect("failed to create tokio runtime")
     ).expect("runtime was set before");
 
-    let cache = moka::future::CacheBuilder::new(static_config().cache_capacity)
-        .time_to_live(Duration::from_secs(static_config().cache_ttl_secs))
-        .time_to_idle(Duration::from_secs(static_config().cache_tti_secs))
-        .build();
-
+    let mut cache_builder = moka::future::CacheBuilder::new(static_config().cache_capacity);
+    if static_config().cache_ttl_secs != 0 {
+        cache_builder = cache_builder.time_to_live(Duration::from_secs(static_config().cache_ttl_secs));
+    }
+    if static_config().cache_tti_secs != 0 {
+        cache_builder = cache_builder.time_to_idle(Duration::from_secs(static_config().cache_tti_secs));
+    }
+    let cache = cache_builder.build();
+        
     CLIENTS.set(cache)
         .expect("cache was set before");
 
@@ -452,7 +458,7 @@ pub extern "C" fn start(
                     }
                 }
             }
-        }).buffer_unordered(512).for_each(|_| async {}).await;
+        }).buffer_unordered(static_config().concurrency_limit as usize).for_each(|_| async {}).await;
     });
     CResult::Ok
 }
