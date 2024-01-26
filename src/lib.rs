@@ -241,6 +241,8 @@ trait NotifyGuard {
     }
 }
 
+// RAII Guard for a Response that ensures the awaiting Julia task will be notified
+// even if this is dropped on a panic.
 pub struct ResponseGuard {
     response: &'static mut Response,
     handle: *const c_void

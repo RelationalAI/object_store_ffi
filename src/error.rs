@@ -3,8 +3,11 @@ use backoff::backoff::Backoff;
 use once_cell::sync::Lazy;
 use crate::{Config, ConfigMeta, clients};
 
+// These regexes are used to extract error info from some object_store private errors.
+// We construct the regexes lazily and reuse them due to the runtime compilation cost.
 static CLIENT_ERR_REGEX: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"Client \{ status: (?<status>\d+?),").unwrap());
 static REQWEST_ERR_REGEX: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"Reqwest \{ retries: (?<retries>\d+?), max_retries: (?<max_retries>\d+?),").unwrap());
+
 
 #[derive(Debug)]
 pub(crate) struct ErrorInfo {
@@ -21,6 +24,8 @@ pub(crate) enum ErrorReason {
 }
 
 fn backoff_duration_for_retry(retries: usize, meta: &ConfigMeta) -> Duration {
+    // We try to use the same settings as the object_store backoff but the implementation is
+    // different so this is best effort.
     let mut backoff = backoff::ExponentialBackoff {
         initial_interval: meta.retry_config.backoff.init_backoff,
         max_interval: meta.retry_config.backoff.max_backoff,
@@ -36,6 +41,11 @@ fn backoff_duration_for_retry(retries: usize, meta: &ConfigMeta) -> Duration {
 
 pub(crate) fn extract_error_info(error: &anyhow::Error) -> ErrorInfo {
     let mut retries = None;
+
+    // Here we go through the chain of type erased errors that led to the current one
+    // trying to downcast each to concrete types. We fallback to error string parsing only on
+    // private errors (as we don't have the type) and mainly to extract helpfull information
+    // on a best effort basis.
     for e in error.chain() {
         if let Some(e) = e.downcast_ref::<reqwest::Error>() {
             if let Some(code) = e.status() {
@@ -72,10 +82,26 @@ pub(crate) fn extract_error_info(error: &anyhow::Error) -> ErrorInfo {
             }
         }
 
+        if let Some(e) = e.downcast_ref::<std::io::Error>() {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                return ErrorInfo {
+                    retries,
+                    reason: ErrorReason::Timeout
+                }
+            } else {
+                return ErrorInfo {
+                    retries,
+                    reason: ErrorReason::Io
+                }
+            }
+        }
+
         let error_debug = format!("{:?}", e);
         if error_debug.starts_with("Client {") {
             if let Some(caps) = CLIENT_ERR_REGEX.captures(&error_debug) {
                 if let Ok(status) = caps["status"].parse() {
+                    // If we find this error we try to extract the status code from its debug
+                    // representation
                     return ErrorInfo {
                         retries,
                         reason: ErrorReason::Code(status)
@@ -84,6 +110,8 @@ pub(crate) fn extract_error_info(error: &anyhow::Error) -> ErrorInfo {
             }
         } else if error_debug.starts_with("Reqwest {") {
             if let Some(caps) = REQWEST_ERR_REGEX.captures(&error_debug) {
+                // If we find this error we try to extract the retries from its debug
+                // representation
                 retries = caps["retries"].parse::<usize>().ok();
             }
         }
