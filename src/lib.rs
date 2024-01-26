@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::{c_char, c_void};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use anyhow::anyhow;
 
 use std::collections::hash_map::DefaultHasher;
@@ -16,6 +16,10 @@ use std::hash::Hasher;
 use object_store::{path::Path, ObjectStore};
 
 use moka::future::Cache;
+
+mod error;
+
+use error::{extract_error_info, should_retry};
 
 // Our global variables needed by our library at runtime. Note that we follow Rust's
 // safety rules here by making them immutable with write-exactly-once semantics using
@@ -27,7 +31,8 @@ static SQ: OnceCell<async_channel::Sender<Request>> = OnceCell::new();
 // The ObjectStore objects contain the context for communicating with a particular
 // storage bucket/account, including authentication info. This caches them so we do
 // not need to pay the construction cost for each request.
-static CLIENTS: OnceCell<Cache<u64, Arc<dyn ObjectStore>>> = OnceCell::new();
+static CLIENTS: OnceCell<Cache<u64, (Arc<dyn ObjectStore>, ConfigMeta)>> = OnceCell::new();
+
 // Contains configuration items that are set during initialization and do not change.
 static STATIC_CONFIG: OnceCell<StaticConfig> = OnceCell::new();
 
@@ -35,7 +40,7 @@ fn runtime() -> &'static Runtime {
     RT.get().expect("start was not called")
 }
 
-fn clients() -> &'static Cache<u64, Arc<dyn ObjectStore>> {
+fn clients() -> &'static Cache<u64, (Arc<dyn ObjectStore>, ConfigMeta)> {
     CLIENTS.get().expect("start was not called")
 }
 
@@ -46,6 +51,7 @@ fn static_config() -> &'static StaticConfig {
 // The result type used for the API functions exposed to Julia. This is used for both
 // synchronous errors, e.g. our dispatch channel is full, and for async errors such
 // as HTTP connection errors as part of the async Response.
+#[derive(Debug, PartialEq, Eq)]
 #[repr(C)]
 pub enum CResult {
     Uninitialized = -1,
@@ -57,8 +63,8 @@ pub enum CResult {
 // The types used for our internal dispatch mechanism, for dispatching Julia requests
 // to our worker task.
 enum Request {
-    Get(Path, &'static mut [u8], &'static Config, &'static mut Response, Notifier),
-    Put(Path, &'static [u8], &'static Config, &'static mut Response, Notifier)
+    Get(Path, &'static mut [u8], &'static Config, ResponseGuard),
+    Put(Path, &'static [u8], &'static Config, ResponseGuard)
 }
 
 unsafe impl Send for Request {}
@@ -116,7 +122,12 @@ impl Config {
     }
 }
 
-pub async fn dyn_connect(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>> {
+#[derive(Debug, Clone)]
+struct ConfigMeta {
+    retry_config: RetryConfig
+}
+
+async fn dyn_connect(config: &Config) -> anyhow::Result<(Arc<dyn ObjectStore>, ConfigMeta)> {
     let value = config.as_json()
             .map_err(|e| anyhow!("failed to parse json serialized config: {}", e))?;
 
@@ -161,7 +172,7 @@ pub async fn dyn_connect(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>
         "s3" => {
             let mut builder = object_store::aws::AmazonS3Builder::default()
                 .with_url(url)
-                .with_retry(retry_config);
+                .with_retry(retry_config.clone());
             for (key, value) in map {
                 builder = builder.with_config(key.parse()?, value);
             }
@@ -170,7 +181,7 @@ pub async fn dyn_connect(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>
         "az" | "azure" => {
             let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
                 .with_url(url)
-                .with_retry(retry_config);
+                .with_retry(retry_config.clone());
             for (key, value) in map {
                 builder = builder.with_config(key.parse()?, value);
             }
@@ -179,7 +190,7 @@ pub async fn dyn_connect(config: &Config) -> anyhow::Result<Arc<dyn ObjectStore>
         _ => unimplemented!("unknown url scheme")
     };
 
-    Ok(client)
+    Ok((client, ConfigMeta { retry_config }))
 }
 
 #[derive(Copy, Clone)]
@@ -210,6 +221,68 @@ impl Default for StaticConfig {
     }
 }
 
+trait NotifyGuard {
+    fn is_uninitialized(&self) -> bool;
+    fn condition_handle(&self) -> *const c_void;
+    fn set_error(&mut self, error: impl std::fmt::Display);
+    fn into_error(mut self, error: impl std::fmt::Display) where Self: Sized {
+        self.set_error(error);
+    }
+    unsafe fn notify(&self) {
+        uv_async_send(self.condition_handle());
+    }
+    fn notify_on_drop(&mut self) {
+        if self.is_uninitialized() {
+            self.set_error("Response was dropped before being initialized, this could be due to a Rust panic");
+            unsafe { self.notify() }
+        } else {
+            unsafe{ self.notify() }
+        }
+    }
+}
+
+pub struct ResponseGuard {
+    response: &'static mut Response,
+    handle: *const c_void
+}
+
+impl NotifyGuard for ResponseGuard {
+    fn is_uninitialized(&self) -> bool {
+        self.response.result == CResult::Uninitialized
+    }
+    fn condition_handle(&self) -> *const c_void {
+        self.handle
+    }
+    fn set_error(&mut self, error: impl std::fmt::Display) {
+        self.response.result = CResult::Error;
+        self.response.length = 0;
+        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
+        self.response.error_message = c_string.into_raw();
+    }
+}
+
+impl ResponseGuard {
+    unsafe fn new(response_ptr: *mut Response, handle: *const c_void) -> ResponseGuard {
+        let response = unsafe { &mut (*response_ptr) };
+        response.result = CResult::Uninitialized;
+
+        ResponseGuard { response, handle }
+    }
+    fn success(self, length: usize) {
+        self.response.result = CResult::Ok;
+        self.response.length = length;
+        self.response.error_message = std::ptr::null_mut();
+    }
+}
+
+impl Drop for ResponseGuard {
+    fn drop(&mut self) {
+        self.notify_on_drop()
+    }
+}
+
+unsafe impl Send for ResponseGuard {}
+
 // The type used to give Julia the result of an async request. It will be allocated
 // by Julia as part of the request and filled in by Rust.
 #[repr(C)]
@@ -221,22 +294,7 @@ pub struct Response {
 
 unsafe impl Send for Response {}
 
-impl Response {
-    fn success(&mut self, length: usize) {
-        self.result = CResult::Ok;
-        self.length = length;
-        self.error_message = std::ptr::null_mut();
-    }
-
-    fn from_error(&mut self, error: impl std::fmt::Display) {
-        self.result = CResult::Error;
-        self.length = 0;
-        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.error_message = c_string.into_raw();
-    }
-}
-
-async fn multipart_get(slice: &'static mut [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<usize> {
+async fn multipart_get(slice: &mut [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<usize> {
     let part_size: usize = static_config().multipart_get_part_size as usize;
     let result = client.head(&path).await?;
     if result.size > slice.len() {
@@ -267,7 +325,7 @@ async fn multipart_get(slice: &'static mut [u8], path: &Path, client: &dyn Objec
     return Ok(accum);
 }
 
-async fn multipart_put(slice: &'static [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<()> {
+async fn multipart_put(slice: &[u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<()> {
     let (multipart_id, mut writer) = client.put_multipart(&path).await?;
     match writer.write_all(slice).await {
         Ok(_) => {
@@ -287,6 +345,57 @@ async fn multipart_put(slice: &'static [u8], path: &Path, client: &dyn ObjectSto
             return Err(e.into());
         }
     };
+}
+
+async fn handle_get(slice: &mut [u8], path: &Path, config: &Config) -> anyhow::Result<usize> {
+    let (client, _) = clients()
+        .try_get_with(config.get_hash(), dyn_connect(config)).await
+        .map_err(|e| anyhow!(e))?;
+
+    // Multipart Get
+    if slice.len() > static_config().multipart_get_threshold as usize {
+        let accum = multipart_get(slice, path, &client).await?;
+        return Ok(accum);
+    }
+
+    // Single part Get
+    let body = client.get(path).await?;
+    let mut chunks = body.into_stream().collect::<Vec<_>>().await;
+    if let Some(pos) = chunks.iter().position(|result| result.is_err()) {
+        let e = chunks.remove(pos).err().expect("already checked for error");
+        tracing::warn!("Error while fetching a chunk: {}", e);
+        return Err(e.into());
+    }
+
+    let mut received_bytes = 0;
+    for result in chunks {
+        let chunk = result.expect("checked `chunks` for errors before calling `spawn`");
+        let len = chunk.len();
+
+        if received_bytes + len > slice.len() {
+            return Err(anyhow!("Supplied buffer was too small"));
+        }
+
+        slice[received_bytes..(received_bytes + len)].copy_from_slice(&chunk);
+        received_bytes += len;
+    }
+
+    Ok(received_bytes)
+}
+
+async fn handle_put(slice: &'static [u8], path: &Path, config: &Config) -> anyhow::Result<usize> {
+    let (client, _) = clients()
+        .try_get_with(config.get_hash(), dyn_connect(config)).await
+        .map_err(|e| anyhow!(e))?;
+
+    let len = slice.len();
+    if len < static_config().multipart_put_threshold as usize {
+        let _ = client.put(path, slice.into()).await?;
+    } else {
+        let _ = multipart_put(slice, path, &client).await?;
+    }
+
+    Ok(len)
 }
 
 #[no_mangle]
@@ -332,7 +441,7 @@ pub extern "C" fn start(
         cache_builder = cache_builder.time_to_idle(Duration::from_secs(static_config().cache_tti_secs));
     }
     let cache = cache_builder.build();
-        
+
     CLIENTS.set(cache)
         .expect("cache was set before");
 
@@ -345,112 +454,46 @@ pub extern "C" fn start(
 
         rx.map(|req| {
             async {
+                let start_instant = Instant::now();
+                let mut retries = 0;
                 match req {
-                    Request::Get(p, slice, config, response, notifier) => {
-                        let client = match clients().try_get_with(config.get_hash(), dyn_connect(config)).await {
-                            Ok(client) => client,
-                            Err(e) => {
-                                response.from_error(e);
-                                notifier.notify();
-                                return;
-                            }
-                        };
-
-                        // Multipart Get
-                        if slice.len() > static_config().multipart_get_threshold as usize {
-                            match multipart_get(slice, &p, &client).await {
-                                Ok(accum) => {
-                                    response.success(accum);
-                                    notifier.notify();
+                    Request::Get(path, slice, config, response) => {
+                        'retry: loop {
+                            match handle_get(slice, &path, config).await {
+                                Ok(len) => {
+                                    response.success(len);
                                     return;
                                 }
                                 Err(e) => {
+                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
+                                        retries += 1;
+                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
+                                        tokio::time::sleep(duration).await;
+                                        continue 'retry;
+                                    }
                                     tracing::warn!("{}", e);
-                                    response.from_error(e);
-                                    notifier.notify();
+                                    response.into_error(e);
                                     return;
                                 }
-                            }
-                        }
-
-                        // Single part Get
-                        match client.get(&p).await {
-                            Ok(result) => {
-                                let chunks = result.into_stream().collect::<Vec<_>>().await;
-                                if let Some(Err(e)) = chunks.iter().find(|result| result.is_err()) {
-                                        tracing::warn!("Error while fetching a chunk: {}", e);
-                                        response.from_error(e);
-                                        notifier.notify();
-                                        return;
-                                }
-                                tokio::spawn(async move {
-                                    let mut received_bytes = 0;
-                                    for result in chunks {
-                                        let chunk = match result {
-                                            Ok(c) => c,
-                                            Err(_e) => {
-                                                unreachable!("checked `chunks` for errors before calling `spawn`");
-                                            }
-                                        };
-                                        let len = chunk.len();
-
-                                        if received_bytes + len > slice.len() {
-                                            response.from_error("Supplied buffer was too small");
-                                            notifier.notify();
-                                            return;
-                                        }
-
-                                        slice[received_bytes..(received_bytes + len)].copy_from_slice(&chunk);
-                                        received_bytes += len;
-                                    }
-                                    response.success(received_bytes);
-                                    notifier.notify();
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!("{}", e);
-                                response.from_error(e);
-                                notifier.notify();
-                                return;
                             }
                         }
                     }
-                    Request::Put(p, slice, config, response, notifier) => {
-                        let client = match clients().try_get_with(config.get_hash(), dyn_connect(config)).await {
-                            Ok(client) => client,
-                            Err(e) => {
-                                response.from_error(e);
-                                notifier.notify();
-                                return;
-                            }
-                        };
-                        let len = slice.len();
-
-                        if len < static_config().multipart_put_threshold as usize {
-                            match client.put(&p, slice.into()).await {
-                                Ok(_) => {
+                    Request::Put(path, slice, config, response) => {
+                        'retry: loop {
+                            match handle_put(slice, &path, config).await {
+                                Ok(len) => {
                                     response.success(len);
-                                    notifier.notify();
                                     return;
                                 }
                                 Err(e) => {
+                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
+                                        retries += 1;
+                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
+                                        tokio::time::sleep(duration).await;
+                                        continue 'retry;
+                                    }
                                     tracing::warn!("{}", e);
-                                    response.from_error(e);
-                                    notifier.notify();
-                                    return;
-                                }
-                            }
-                        } else {
-                            match multipart_put(slice, &p, &client).await {
-                                Ok(_) => {
-                                    response.success(len);
-                                    notifier.notify();
-                                    return;
-                                }
-                                Err(e) => {
-                                    tracing::warn!("{}", e);
-                                    response.from_error(e);
-                                    notifier.notify();
+                                    response.into_error(e);
                                     return;
                                 }
                             }
@@ -472,16 +515,14 @@ pub extern "C" fn get(
     response: *mut Response,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { &mut (*response) };
-    response.result = CResult::Uninitialized;
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
     let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
     let slice = unsafe { std::slice::from_raw_parts_mut(buffer, size) };
     let config = unsafe { & (*config) };
-    let notifier = Notifier { handle };
     match SQ.get() {
         Some(sq) => {
-            match sq.try_send(Request::Get(path, slice, config, response, notifier)) {
+            match sq.try_send(Request::Get(path, slice, config, response)) {
                 Ok(_) => CResult::Ok,
                 Err(async_channel::TrySendError::Full(_)) => {
                     CResult::Backoff
@@ -506,16 +547,14 @@ pub extern "C" fn put(
     response: *mut Response,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { &mut (*response) };
-    response.result = CResult::Uninitialized;
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
     let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
     let slice = unsafe { std::slice::from_raw_parts(buffer, size) };
     let config = unsafe { & (*config) };
-    let notifier = Notifier { handle };
     match SQ.get() {
         Some(sq) => {
-            match sq.try_send(Request::Put(path, slice, config, response, notifier)) {
+            match sq.try_send(Request::Put(path, slice, config, response)) {
                 Ok(_) => CResult::Ok,
                 Err(async_channel::TrySendError::Full(_)) => {
                     CResult::Backoff
