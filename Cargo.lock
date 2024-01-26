@@ -914,6 +914,7 @@ dependencies = [
  "bytes",
  "crossbeam-queue",
  "futures-util",
+ "hyper",
  "moka",
  "object_store",
  "once_cell",

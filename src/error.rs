@@ -58,6 +58,20 @@ pub(crate) fn extract_error_info(error: &anyhow::Error) -> ErrorInfo {
             }
         }
 
+        if let Some(e) = e.downcast_ref::<hyper::Error>() {
+            if e.is_closed() || e.is_incomplete_message() || e.is_body_write_aborted() {
+                return ErrorInfo {
+                    retries,
+                    reason: ErrorReason::Io
+                }
+            } else if e.is_timeout() {
+                return ErrorInfo {
+                    retries,
+                    reason: ErrorReason::Timeout
+                }
+            }
+        }
+
         let error_debug = format!("{:?}", e);
         if error_debug.starts_with("Client {") {
             if let Some(caps) = CLIENT_ERR_REGEX.captures(&error_debug) {
