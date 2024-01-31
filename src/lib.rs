@@ -1,6 +1,6 @@
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
-use object_store::RetryConfig;
+use object_store::{RetryConfig, ObjectMeta};
 use once_cell::sync::OnceCell;
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Runtime;
@@ -654,15 +654,60 @@ pub struct ListResponse {
 
 unsafe impl Send for ListResponse {}
 
-impl ListResponse {
-    fn from_error(&mut self, error: impl std::fmt::Display) {
-        self.result = CResult::Error;
-        self.entries = std::ptr::null();
-        self.entry_count = 0;
+// RAII Guard for a ListResponse that ensures the awaiting Julia task will be notified
+// even if this is dropped on a panic.
+pub struct ListResponseGuard {
+    response: &'static mut ListResponse,
+    handle: *const c_void
+}
+
+impl NotifyGuard for ListResponseGuard {
+    fn is_uninitialized(&self) -> bool {
+        self.response.result == CResult::Uninitialized
+    }
+    fn condition_handle(&self) -> *const c_void {
+        self.handle
+    }
+    fn set_error(&mut self, error: impl std::fmt::Display) {
+        self.response.result = CResult::Error;
+        self.response.entries = std::ptr::null();
+        self.response.entry_count = 0;
         let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.error_message = c_string.into_raw();
+        self.response.error_message = c_string.into_raw();
     }
 }
+
+impl ListResponseGuard {
+    unsafe fn new(response_ptr: *mut ListResponse, handle: *const c_void) -> ListResponseGuard {
+        let response = unsafe { &mut (*response_ptr) };
+        response.result = CResult::Uninitialized;
+
+        ListResponseGuard { response, handle }
+    }
+    fn success(self, entries: Vec<ObjectMeta>) { // TODO entries
+        let entries_slice = entries.into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let entry_count = entries_slice.len() as u64;
+        let entries_ptr = entries_slice.as_ptr();
+        std::mem::forget(entries_slice);
+
+        self.response.result = CResult::Ok;
+        self.response.entry_count = entry_count;
+        self.response.entries = entries_ptr;
+        self.response.error_message = std::ptr::null_mut();
+    }
+}
+
+impl Drop for ListResponseGuard {
+    fn drop(&mut self) {
+        self.notify_on_drop()
+    }
+}
+
+unsafe impl Send for ListResponseGuard {}
 
 #[no_mangle]
 pub extern "C" fn destroy_list_entries(
@@ -721,50 +766,46 @@ pub extern "C" fn list(
     response: *mut ListResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { &mut (*response) };
-    response.result = CResult::Uninitialized;
+    let response = unsafe { ListResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
     let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
     let config = unsafe { & (*config) };
-    let notifier = Notifier { handle };
 
     match RT.get() {
         Some(runtime) => {
             runtime.spawn(async move {
-                let list_op = async move {
-                    let client = clients()
-                        .try_get_with(config.get_hash(), dyn_connect(config))
-                        .await
-                        .map_err(|e| anyhow!(e))?;
+                let start_instant = Instant::now();
+                let mut retries = 0;
+                'retry: loop {
+                    let list_op = async {
+                        let (client, _) = clients()
+                            .try_get_with(config.get_hash(), dyn_connect(config))
+                            .await
+                            .map_err(|e| anyhow!(e))?;
 
-                    let stream = client.list(Some(&prefix));
+                        let stream = client.list(Some(&prefix));
 
-                    let entries: Vec<_> = stream.collect().await;
-                    let entries = entries.into_iter().collect::<Result<Vec<_>, _>>()?;
-                    let entries_slice = entries.into_iter()
-                        .map(Into::into)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
+                        let entries: Vec<_> = stream.collect().await;
+                        let entries = entries.into_iter().collect::<Result<Vec<_>, _>>()?;
+                        Ok::<_, anyhow::Error>(entries)
+                    };
 
-                    let entry_count = entries_slice.len() as u64;
-                    let entries_ptr = entries_slice.as_ptr();
-                    std::mem::forget(entries_slice);
-
-                    Ok::<_, anyhow::Error>((entry_count, entries_ptr))
-                };
-
-                match list_op.await {
-                    Ok((entry_count, entries_ptr)) => {
-                        response.result = CResult::Ok;
-                        response.entry_count = entry_count;
-                        response.entries = entries_ptr;
-                        response.error_message = std::ptr::null_mut();
-                        notifier.notify();
-                    },
-                    Err(e) => {
-                        tracing::warn!("{}", e);
-                        response.from_error(e);
-                        notifier.notify();
+                    match list_op.await {
+                        Ok(entries) => {
+                            response.success(entries);
+                            return;
+                        },
+                        Err(e) => {
+                            if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
+                                retries += 1;
+                                tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
+                                tokio::time::sleep(duration).await;
+                                continue 'retry;
+                            }
+                            tracing::warn!("{}", e);
+                            response.into_error(e);
+                            return;
+                        }
                     }
                 }
             });
@@ -801,14 +842,49 @@ pub struct ListStreamResponse {
 
 unsafe impl Send for ListStreamResponse {}
 
-impl ListStreamResponse {
-    fn from_error(&mut self, error: impl std::fmt::Display) {
-        self.result = CResult::Error;
-        self.stream = std::ptr::null_mut();
+// RAII Guard for a ListResponse that ensures the awaiting Julia task will be notified
+// even if this is dropped on a panic.
+pub struct ListStreamResponseGuard {
+    response: &'static mut ListStreamResponse,
+    handle: *const c_void
+}
+
+impl NotifyGuard for ListStreamResponseGuard {
+    fn is_uninitialized(&self) -> bool {
+        self.response.result == CResult::Uninitialized
+    }
+    fn condition_handle(&self) -> *const c_void {
+        self.handle
+    }
+    fn set_error(&mut self, error: impl std::fmt::Display) {
+        self.response.result = CResult::Error;
+        self.response.stream = std::ptr::null_mut();
         let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.error_message = c_string.into_raw();
+        self.response.error_message = c_string.into_raw();
     }
 }
+
+impl ListStreamResponseGuard {
+    unsafe fn new(response_ptr: *mut ListStreamResponse, handle: *const c_void) -> ListStreamResponseGuard {
+        let response = unsafe { &mut (*response_ptr) };
+        response.result = CResult::Uninitialized;
+
+        ListStreamResponseGuard { response, handle }
+    }
+    fn success(self, stream: Box<StreamWrapper>) {
+        self.response.result = CResult::Ok;
+        self.response.stream = Box::into_raw(stream);
+        self.response.error_message = std::ptr::null_mut();
+    }
+}
+
+impl Drop for ListStreamResponseGuard {
+    fn drop(&mut self) {
+        self.notify_on_drop()
+    }
+}
+
+unsafe impl Send for ListStreamResponseGuard {}
 
 #[no_mangle]
 pub extern "C" fn list_stream(
@@ -817,48 +893,54 @@ pub extern "C" fn list_stream(
     response: *mut ListStreamResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { &mut (*response) };
-    response.result = CResult::Uninitialized;
+    let response = unsafe { ListStreamResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
     let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
     let config = unsafe { & (*config) };
-    let notifier = Notifier { handle };
 
     match RT.get() {
         Some(runtime) => {
             runtime.spawn(async move {
-                let list_op = async move {
-                    let client = clients()
-                        .try_get_with(config.get_hash(), dyn_connect(config))
-                        .await
-                        .map_err(|e| anyhow!(e))?;
+                let start_instant = Instant::now();
+                let mut retries = 0;
+                'retry: loop {
+                    let list_op = async {
+                        let (client, _) = clients()
+                            .try_get_with(config.get_hash(), dyn_connect(config))
+                            .await
+                            .map_err(|e| anyhow!(e))?;
 
-                    let mut wrapper = Box::new(StreamWrapper {
-                        client,
-                        stream: None
-                    });
+                        let mut wrapper = Box::new(StreamWrapper {
+                            client,
+                            stream: None
+                        });
 
-                    let stream = wrapper.client.list(Some(&prefix)).chunks(1000).boxed();
+                        let stream = wrapper.client.list(Some(&prefix)).chunks(1000).boxed();
 
-                    // Safety: This is needed because the compiler cannot infer that the stream
-                    // will outlive the client. We ensure this happens
-                    // by droping the stream before droping the Arc on destroy_list_stream
-                    wrapper.stream = Some(unsafe { std::mem::transmute(stream) });
+                        // Safety: This is needed because the compiler cannot infer that the stream
+                        // will outlive the client. We ensure this happens
+                        // by droping the stream before droping the Arc on destroy_list_stream
+                        wrapper.stream = Some(unsafe { std::mem::transmute(stream) });
 
-                    Ok::<_, anyhow::Error>(wrapper)
-                };
+                        Ok::<_, anyhow::Error>(wrapper)
+                    };
 
-                match list_op.await {
-                    Ok(wrapper) => {
-                        response.result = CResult::Ok;
-                        response.stream = Box::into_raw(wrapper);
-                        response.error_message = std::ptr::null_mut();
-                        notifier.notify();
-                    },
-                    Err(e) => {
-                        tracing::warn!("{}", e);
-                        response.from_error(e);
-                        notifier.notify();
+                    match list_op.await {
+                        Ok(wrapper) => {
+                            response.success(wrapper);
+                            return;
+                        },
+                        Err(e) => {
+                            if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
+                                retries += 1;
+                                tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
+                                tokio::time::sleep(duration).await;
+                                continue 'retry;
+                            }
+                            tracing::warn!("{}", e);
+                            response.into_error(e);
+                            return;
+                        }
                     }
                 }
             });
@@ -876,9 +958,7 @@ pub extern "C" fn next_list_stream_chunk(
     response: *mut ListResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { &mut (*response) };
-    response.result = CResult::Uninitialized;
-    let notifier = Notifier { handle };
+    let response = unsafe { ListResponseGuard::new(response, handle) };
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
@@ -890,41 +970,26 @@ pub extern "C" fn next_list_stream_chunk(
     match RT.get() {
         Some(runtime) => {
             runtime.spawn(async move {
-                let list_op = async move {
+                let list_op = async {
                     let stream_ref = wrapper.stream.as_mut().unwrap();
-                    let result = match stream_ref.next().await {
+                    let option = match stream_ref.next().await {
                         Some(vec) => {
-                            let entries = vec.into_iter().collect::<Result<Vec<_>, _>>()?;
-                            let entries_slice = entries.into_iter()
-                                .map(Into::into)
-                                .collect::<Vec<_>>()
-                                .into_boxed_slice();
-
-                            let entry_count = entries_slice.len() as u64;
-                            let entries_ptr = entries_slice.as_ptr();
-                            std::mem::forget(entries_slice);
-
-                            (entry_count, entries_ptr)
+                            vec.into_iter().collect::<Result<Vec<_>, _>>()?
                         }
                         None => {
-                            (0, std::ptr::null())
+                            vec![]
                         }
                     };
-                    Ok::<_, anyhow::Error>(result)
+                    Ok::<_, anyhow::Error>(option)
                 };
 
                 match list_op.await {
-                    Ok((entry_count, entries_ptr)) => {
-                        response.result = CResult::Ok;
-                        response.entries = entries_ptr;
-                        response.entry_count = entry_count;
-                        response.error_message = std::ptr::null_mut();
-                        notifier.notify();
+                    Ok(entries) => {
+                        response.success(entries);
                     },
                     Err(e) => {
                         tracing::warn!("{}", e);
-                        response.from_error(e);
-                        notifier.notify();
+                        response.into_error(e);
                     }
                 }
             });
