@@ -64,7 +64,8 @@ pub enum CResult {
 // to our worker task.
 enum Request {
     Get(Path, &'static mut [u8], &'static Config, ResponseGuard),
-    Put(Path, &'static [u8], &'static Config, ResponseGuard)
+    Put(Path, &'static [u8], &'static Config, ResponseGuard),
+    Delete(Path, &'static Config, ResponseGuard)
 }
 
 unsafe impl Send for Request {}
@@ -400,6 +401,16 @@ async fn handle_put(slice: &'static [u8], path: &Path, config: &Config) -> anyho
     Ok(len)
 }
 
+async fn handle_delete(path: &Path, config: &Config) -> anyhow::Result<()> {
+    let (client, _) = clients()
+        .try_get_with(config.get_hash(), dyn_connect(config)).await
+        .map_err(|e| anyhow!(e))?;
+
+    client.delete(path).await?;
+
+    Ok(())
+}
+
 #[no_mangle]
 pub extern "C" fn start(
     config: StaticConfig,
@@ -501,6 +512,27 @@ pub extern "C" fn start(
                             }
                         }
                     }
+                    Request::Delete(path, config, response) => {
+                        'retry: loop {
+                            match handle_delete(&path, config).await {
+                                Ok(()) => {
+                                    response.success(0);
+                                    return;
+                                }
+                                Err(e) => {
+                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
+                                        retries += 1;
+                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
+                                        tokio::time::sleep(duration).await;
+                                        continue 'retry;
+                                    }
+                                    tracing::warn!("{}", e);
+                                    response.into_error(e);
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }).buffer_unordered(static_config().concurrency_limit as usize).for_each(|_| async {}).await;
@@ -557,6 +589,35 @@ pub extern "C" fn put(
     match SQ.get() {
         Some(sq) => {
             match sq.try_send(Request::Put(path, slice, config, response)) {
+                Ok(_) => CResult::Ok,
+                Err(async_channel::TrySendError::Full(_)) => {
+                    CResult::Backoff
+                }
+                Err(async_channel::TrySendError::Closed(_)) => {
+                    CResult::Error
+                }
+            }
+        }
+        None => {
+            return CResult::Error;
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn delete(
+    path: *const c_char,
+    config: *const Config,
+    response: *mut Response,
+    handle: *const c_void
+) -> CResult {
+    let response = unsafe { ResponseGuard::new(response, handle) };
+    let path = unsafe { std::ffi::CStr::from_ptr(path) };
+    let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
+    let config = unsafe { & (*config) };
+    match SQ.get() {
+        Some(sq) => {
+            match sq.try_send(Request::Delete(path, config, response)) {
                 Ok(_) => CResult::Ok,
                 Err(async_channel::TrySendError::Full(_)) => {
                     CResult::Backoff
