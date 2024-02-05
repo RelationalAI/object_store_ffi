@@ -684,7 +684,7 @@ impl ListResponseGuard {
 
         ListResponseGuard { response, handle }
     }
-    fn success(self, entries: Vec<ObjectMeta>) { // TODO entries
+    fn success(self, entries: Vec<ObjectMeta>) {
         let entries_slice = entries.into_iter()
             .map(Into::into)
             .collect::<Vec<_>>()
