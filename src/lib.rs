@@ -66,7 +66,9 @@ pub enum CResult {
 enum Request {
     Get(Path, &'static mut [u8], &'static Config, ResponseGuard),
     Put(Path, &'static [u8], &'static Config, ResponseGuard),
-    Delete(Path, &'static Config, ResponseGuard)
+    Delete(Path, &'static Config, ResponseGuard),
+    List(Path, &'static Config, ListResponseGuard),
+    ListStream(Path, &'static Config, ListStreamResponseGuard)
 }
 
 unsafe impl Send for Request {}
@@ -412,6 +414,40 @@ async fn handle_delete(path: &Path, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn handle_list(prefix: &Path, config: &Config) -> anyhow::Result<Vec<ObjectMeta>> {
+    let (client, _) = clients()
+        .try_get_with(config.get_hash(), dyn_connect(config))
+        .await
+        .map_err(|e| anyhow!(e))?;
+
+    let stream = client.list(Some(&prefix));
+
+    let entries: Vec<_> = stream.collect().await;
+    let entries = entries.into_iter().collect::<Result<Vec<_>, _>>()?;
+    Ok(entries)
+}
+
+async fn handle_list_stream(prefix: &Path, config: &Config) -> anyhow::Result<Box<StreamWrapper>> {
+    let (client, _) = clients()
+        .try_get_with(config.get_hash(), dyn_connect(config))
+        .await
+        .map_err(|e| anyhow!(e))?;
+
+    let mut wrapper = Box::new(StreamWrapper {
+        client,
+        stream: None
+    });
+
+    let stream = wrapper.client.list(Some(&prefix)).chunks(1000).boxed();
+
+    // Safety: This is needed because the compiler cannot infer that the stream
+    // will outlive the client. We ensure this happens
+    // by droping the stream before droping the Arc on destroy_list_stream
+    wrapper.stream = Some(unsafe { std::mem::transmute(stream) });
+
+    Ok(wrapper)
+}
+
 #[no_mangle]
 pub extern "C" fn start(
     config: StaticConfig,
@@ -518,6 +554,48 @@ pub extern "C" fn start(
                             match handle_delete(&path, config).await {
                                 Ok(()) => {
                                     response.success(0);
+                                    return;
+                                }
+                                Err(e) => {
+                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
+                                        retries += 1;
+                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
+                                        tokio::time::sleep(duration).await;
+                                        continue 'retry;
+                                    }
+                                    tracing::warn!("{}", e);
+                                    response.into_error(e);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Request::List(prefix, config, response) => {
+                        'retry: loop {
+                            match handle_list(&prefix, config).await {
+                                Ok(entries) => {
+                                    response.success(entries);
+                                    return;
+                                }
+                                Err(e) => {
+                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
+                                        retries += 1;
+                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
+                                        tokio::time::sleep(duration).await;
+                                        continue 'retry;
+                                    }
+                                    tracing::warn!("{}", e);
+                                    response.into_error(e);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Request::ListStream(prefix, config, response) => {
+                        'retry: loop {
+                            match handle_list_stream(&prefix, config).await {
+                                Ok(stream) => {
+                                    response.success(stream);
                                     return;
                                 }
                                 Err(e) => {
@@ -770,46 +848,17 @@ pub extern "C" fn list(
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
     let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
     let config = unsafe { & (*config) };
-
-    match RT.get() {
-        Some(runtime) => {
-            runtime.spawn(async move {
-                let start_instant = Instant::now();
-                let mut retries = 0;
-                'retry: loop {
-                    let list_op = async {
-                        let (client, _) = clients()
-                            .try_get_with(config.get_hash(), dyn_connect(config))
-                            .await
-                            .map_err(|e| anyhow!(e))?;
-
-                        let stream = client.list(Some(&prefix));
-
-                        let entries: Vec<_> = stream.collect().await;
-                        let entries = entries.into_iter().collect::<Result<Vec<_>, _>>()?;
-                        Ok::<_, anyhow::Error>(entries)
-                    };
-
-                    match list_op.await {
-                        Ok(entries) => {
-                            response.success(entries);
-                            return;
-                        },
-                        Err(e) => {
-                            if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
-                                retries += 1;
-                                tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                tokio::time::sleep(duration).await;
-                                continue 'retry;
-                            }
-                            tracing::warn!("{}", e);
-                            response.into_error(e);
-                            return;
-                        }
-                    }
+    match SQ.get() {
+        Some(sq) => {
+            match sq.try_send(Request::List(prefix, config, response)) {
+                Ok(_) => CResult::Ok,
+                Err(async_channel::TrySendError::Full(_)) => {
+                    CResult::Backoff
                 }
-            });
-            CResult::Ok
+                Err(async_channel::TrySendError::Closed(_)) => {
+                    CResult::Error
+                }
+            }
         }
         None => {
             return CResult::Error;
@@ -897,54 +946,17 @@ pub extern "C" fn list_stream(
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
     let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
     let config = unsafe { & (*config) };
-
-    match RT.get() {
-        Some(runtime) => {
-            runtime.spawn(async move {
-                let start_instant = Instant::now();
-                let mut retries = 0;
-                'retry: loop {
-                    let list_op = async {
-                        let (client, _) = clients()
-                            .try_get_with(config.get_hash(), dyn_connect(config))
-                            .await
-                            .map_err(|e| anyhow!(e))?;
-
-                        let mut wrapper = Box::new(StreamWrapper {
-                            client,
-                            stream: None
-                        });
-
-                        let stream = wrapper.client.list(Some(&prefix)).chunks(1000).boxed();
-
-                        // Safety: This is needed because the compiler cannot infer that the stream
-                        // will outlive the client. We ensure this happens
-                        // by droping the stream before droping the Arc on destroy_list_stream
-                        wrapper.stream = Some(unsafe { std::mem::transmute(stream) });
-
-                        Ok::<_, anyhow::Error>(wrapper)
-                    };
-
-                    match list_op.await {
-                        Ok(wrapper) => {
-                            response.success(wrapper);
-                            return;
-                        },
-                        Err(e) => {
-                            if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
-                                retries += 1;
-                                tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                tokio::time::sleep(duration).await;
-                                continue 'retry;
-                            }
-                            tracing::warn!("{}", e);
-                            response.into_error(e);
-                            return;
-                        }
-                    }
+    match SQ.get() {
+        Some(sq) => {
+            match sq.try_send(Request::ListStream(prefix, config, response)) {
+                Ok(_) => CResult::Ok,
+                Err(async_channel::TrySendError::Full(_)) => {
+                    CResult::Backoff
                 }
-            });
-            CResult::Ok
+                Err(async_channel::TrySendError::Closed(_)) => {
+                    CResult::Error
+                }
+            }
         }
         None => {
             return CResult::Error;
