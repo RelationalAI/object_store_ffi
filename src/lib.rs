@@ -1164,7 +1164,6 @@ impl Drop for ReadResponseGuard {
 unsafe impl Send for ReadResponseGuard {}
 
 pub struct GetStreamWrapper {
-    // stream: BoxStream<'static, Vec<Result<bytes::Bytes, anyhow::Error>>>
     reader: StreamReader<BoxStream<'static, Result<bytes::Bytes, std::io::Error>>, bytes::Bytes>
 }
 
