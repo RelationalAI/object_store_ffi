@@ -1292,8 +1292,7 @@ pub extern "C" fn read_get_stream(
                         let n = wrapper.reader.read_buf(&mut slice).await?;
 
                         if n == 0 {
-                            let eof = amount_to_read != bytes_read;
-                            return Ok((bytes_read, eof))
+                            return Ok((bytes_read, true))
                         } else {
                             bytes_read += n;
                         }
