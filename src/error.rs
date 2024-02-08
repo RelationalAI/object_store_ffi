@@ -23,7 +23,7 @@ pub(crate) enum ErrorReason {
     Timeout
 }
 
-fn backoff_duration_for_retry(retries: usize, meta: &ConfigMeta) -> Duration {
+pub(crate) fn backoff_duration_for_retry(retries: usize, meta: &ConfigMeta) -> Duration {
     // We try to use the same settings as the object_store backoff but the implementation is
     // different so this is best effort.
     let mut backoff = backoff::ExponentialBackoff {
