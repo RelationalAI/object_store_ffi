@@ -7,9 +7,9 @@ use object_store::{path::Path, ObjectStore};
 use std::time::Instant;
 use bytes::Buf;
 use tokio_util::io::StreamReader;
-use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncWrite};
+use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncWrite, AsyncBufReadExt};
 use anyhow::anyhow;
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_void, CString, c_longlong};
 use futures_util::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ pub(crate) async fn handle_get_stream(path: &Path, size_hint: usize, compression
         let stream = result.into_stream().map_err(Into::<std::io::Error>::into).boxed();
         let reader = StreamReader::new(stream);
         let decoded = with_decoder(compression, reader);
-        return Ok((Box::new(ReadStream { reader: decoded }), full_size));
+        return Ok((Box::new(ReadStream { reader: tokio::io::BufReader::with_capacity(64 * 1024, decoded) }), full_size));
     } else {
         // Perform head request and prefetch parts in parallel
         let meta = client.head(&path).await?;
@@ -70,7 +70,7 @@ pub(crate) async fn handle_get_stream(path: &Path, size_hint: usize, compression
 
         let reader = StreamReader::new(stream);
         let decoded = with_decoder(compression, reader);
-        return Ok((Box::new(ReadStream { reader: decoded }), meta.size));
+        return Ok((Box::new(ReadStream { reader: tokio::io::BufReader::with_capacity(64 * 1024, decoded) }), meta.size));
     }
 }
 
@@ -96,7 +96,7 @@ pub struct ReadResponse {
 
 unsafe impl Send for ReadResponse {}
 
-// RAII Guard for a ListResponse that ensures the awaiting Julia task will be notified
+// RAII Guard for a ReadResponse that ensures the awaiting Julia task will be notified
 // even if this is dropped on a panic.
 pub struct ReadResponseGuard {
     response: &'static mut ReadResponse,
@@ -143,7 +143,7 @@ impl Drop for ReadResponseGuard {
 unsafe impl Send for ReadResponseGuard {}
 
 pub struct ReadStream {
-    reader: Box<dyn AsyncRead + Unpin + Send>
+    reader: tokio::io::BufReader<Box<dyn AsyncRead + Unpin + Send>>
 }
 
 #[no_mangle]
@@ -165,7 +165,7 @@ pub struct GetStreamResponse {
 
 unsafe impl Send for GetStreamResponse {}
 
-// RAII Guard for a ListResponse that ensures the awaiting Julia task will be notified
+// RAII Guard for a GetStreamResponse that ensures the awaiting Julia task will be notified
 // even if this is dropped on a panic.
 pub struct GetStreamResponseGuard {
     response: &'static mut GetStreamResponse,
@@ -309,6 +309,69 @@ pub extern "C" fn read_from_stream(
     }
 }
 
+// Returns the amount of bytes that is currently available in the reader's buffer.
+// This function is synchronous and does not block.
+#[no_mangle]
+pub extern "C" fn bytes_available(
+    stream: *mut ReadStream
+) -> c_longlong {
+    let wrapper = match unsafe { stream.as_mut() } {
+        Some(w) => w,
+        None => {
+            tracing::error!("null stream pointer");
+            return -1;
+        }
+    };
+
+    let available = wrapper.reader.buffer().len();
+    return available as c_longlong
+}
+
+// Checks if the end of stream is reached without changing the current
+// stream position. If EOS is not reached it ensures the internal buffer
+// has data available for a subsequent `read_from_stream`.
+#[no_mangle]
+pub extern "C" fn is_end_of_stream(
+    stream: *mut ReadStream,
+    response: *mut ReadResponse,
+    handle: *const c_void
+) -> CResult {
+    let response = unsafe { ReadResponseGuard::new(response, handle) };
+    let wrapper = match unsafe { stream.as_mut() } {
+        Some(w) => w,
+        None => {
+            std::mem::forget(response);
+            tracing::error!("null stream pointer");
+            return CResult::Error;
+        }
+    };
+
+    match RT.get() {
+        Some(runtime) => {
+            runtime.spawn(async move {
+                match wrapper.reader.fill_buf().await {
+                    Ok(buffer) => {
+                        if buffer.is_empty() {
+                            // reached EOF
+                            response.success(0, true);
+                        } else {
+                            response.success(buffer.len(), false)
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("{}", e);
+                        response.into_error(e);
+                    }
+                }
+            });
+            CResult::Ok
+        }
+        None => {
+            return CResult::Error;
+        }
+    }
+}
+
 #[repr(C)]
 pub struct WriteResponse {
     result: CResult,
@@ -318,7 +381,7 @@ pub struct WriteResponse {
 
 unsafe impl Send for WriteResponse {}
 
-// RAII Guard for a ListResponse that ensures the awaiting Julia task will be notified
+// RAII Guard for a WriteResponse that ensures the awaiting Julia task will be notified
 // even if this is dropped on a panic.
 pub struct WriteResponseGuard {
     response: &'static mut WriteResponse,
@@ -443,6 +506,18 @@ impl Drop for PutStreamResponseGuard {
 
 unsafe impl Send for PutStreamResponseGuard {}
 
+// Creates a `WriteStream` that splits the written data into parts and uploads them
+// concurrently to form a single object.
+//
+// The parts have 10MB in size and up to 8 uploads are dispatched concurrently.
+//
+// Data can be written to the `WriteStream` using `write_to_stream`.
+//
+// `shutdown_write_stream` must be called on the returned `WriteStream` to finalize the
+// operation once all data has been written to it.
+//
+// The written data can be optionally compressed by providing one of `gzip`, `deflate`, `zlib` or
+// `zstd` in the `compress` argument.
 #[no_mangle]
 pub extern "C" fn put_stream(
     path: *const c_char,
@@ -483,6 +558,11 @@ pub extern "C" fn put_stream(
     }
 }
 
+// Writes bytes to the provided `WriteStream` and optionally flushes the internal buffers.
+// Any data written to the stream will be buffered and split into 10 MB chunks before being sent
+// concurrently (concurrency == 8) to the backend.
+//
+// Flushing is not required, it is only exposed to give more control over the internal buffering.
 #[no_mangle]
 pub extern "C" fn write_to_stream(
     stream: *mut WriteStream,
@@ -538,6 +618,12 @@ pub extern "C" fn write_to_stream(
     }
 }
 
+// In order to be able to observe any of the data written to the `WriteStream` this function must be
+// called. It ensures that all data is flushed and that the proper completion request is sent to
+// the cloud backend.
+//
+// Failure to call this function may cause incomplete data parts to be written
+// to the backend, possibly incurring storage costs.
 #[no_mangle]
 pub extern "C" fn shutdown_write_stream(
     stream: *mut WriteStream,

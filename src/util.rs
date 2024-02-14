@@ -33,6 +33,8 @@ pub(crate) fn size_to_ranges(object_size: usize) -> Vec<Range<usize>> {
 pub(crate) enum Compression {
     None,
     Gzip,
+    Deflate,
+    Zlib,
     Zstd
 }
 
@@ -46,6 +48,8 @@ impl TryFrom<*const c_char> for Compression {
             match codec_str {
                 "" => Ok(Compression::None),
                 "gzip" => Ok(Compression::Gzip),
+                "deflate" => Ok(Compression::Deflate),
+                "zlib" => Ok(Compression::Zlib),
                 "zstd" => Ok(Compression::Zstd),
                 c => {
                     Err(anyhow!("compression codec {} not implemented", c))
@@ -60,6 +64,12 @@ pub(crate) fn with_decoder(compression: Compression, reader: impl AsyncBufRead +
         Compression::Gzip => {
             return Box::new(async_compression::tokio::bufread::GzipDecoder::new(reader));
         }
+        Compression::Deflate => {
+            return Box::new(async_compression::tokio::bufread::DeflateDecoder::new(reader));
+        }
+        Compression::Zlib => {
+            return Box::new(async_compression::tokio::bufread::ZlibDecoder::new(reader));
+        }
         Compression::Zstd => {
             return Box::new(async_compression::tokio::bufread::ZstdDecoder::new(reader));
         }
@@ -73,6 +83,12 @@ pub(crate) fn with_encoder(compression: Compression, writer: impl AsyncWrite + U
     match compression {
         Compression::Gzip => {
             return Box::new(async_compression::tokio::write::GzipEncoder::new(writer));
+        }
+        Compression::Deflate => {
+            return Box::new(async_compression::tokio::write::DeflateEncoder::new(writer));
+        }
+        Compression::Zlib => {
+            return Box::new(async_compression::tokio::write::ZlibEncoder::new(writer));
         }
         Compression::Zstd => {
             return Box::new(async_compression::tokio::write::ZstdEncoder::new(writer));
