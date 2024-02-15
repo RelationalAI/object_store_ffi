@@ -573,7 +573,11 @@ pub extern "C" fn write_to_stream(
     handle: *const c_void
 ) -> CResult {
     let response = unsafe { WriteResponseGuard::new(response, handle) };
-    let mut slice = unsafe { std::slice::from_raw_parts(buffer, size) };
+    let mut slice = if buffer.is_null() && size == 0 {
+        unsafe { std::slice::from_raw_parts(std::ptr::NonNull::dangling().as_ptr(), 0) }
+    } else {
+        unsafe { std::slice::from_raw_parts(buffer, size) }
+    };
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {

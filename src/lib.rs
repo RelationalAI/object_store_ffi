@@ -24,8 +24,8 @@ use error::{extract_error_info, should_retry};
 mod list;
 use list::{handle_list, handle_list_stream, ListResponseGuard, ListStreamResponseGuard};
 
-mod ops;
-use ops::{handle_get, handle_put, handle_delete, ResponseGuard};
+mod crud_ops;
+use crud_ops::{handle_get, handle_put, handle_delete, ResponseGuard};
 
 mod stream;
 use stream::{handle_get_stream, handle_put_stream, GetStreamResponseGuard, PutStreamResponseGuard};
