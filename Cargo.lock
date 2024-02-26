@@ -971,7 +971,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.9.0"
-source = "git+https://github.com/andrebsguedes/arrow-rs.git?branch=azure-no-credentials#f6b5ecedad9b68c7ec9c7f56824ac2dfc260a35c"
+source = "git+https://github.com/apache/arrow-rs.git?rev=0fd9b8a#0fd9b8af8f4dd090680b149e8607474b42effa19"
 dependencies = [
  "async-trait",
  "base64",
