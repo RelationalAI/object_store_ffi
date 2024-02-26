@@ -181,6 +181,20 @@ async fn dyn_connect(config: &Config) -> anyhow::Result<(Arc<dyn ObjectStore>, C
             .map_err(|e| anyhow!("failed to parse retry_timeout_sec: {}", e))?
         );
     }
+    if let Some(value) = map.remove("initial_backoff_ms") {
+        retry_config.backoff.init_backoff = std::time::Duration::from_millis(value.parse()
+            .map_err(|e| anyhow!("failed to parse initial_backoff_ms: {}", e))?
+        );
+    }
+    if let Some(value) = map.remove("max_backoff_ms") {
+        retry_config.backoff.max_backoff = std::time::Duration::from_millis(value.parse()
+            .map_err(|e| anyhow!("failed to parse max_backoff_ms: {}", e))?
+        );
+    }
+    if let Some(value) = map.remove("backoff_exp_base") {
+        retry_config.backoff.base = value.parse()
+            .map_err(|e| anyhow!("failed to parse backoff_exp_base: {}", e))?;
+    }
 
     let client: Arc<dyn ObjectStore> = match url.scheme() {
         "s3" => {
