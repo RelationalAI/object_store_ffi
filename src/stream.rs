@@ -222,13 +222,17 @@ pub extern "C" fn get_stream(
 ) -> CResult {
     let response = unsafe { GetStreamResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
+    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let decompress = match Compression::try_from(decompress) {
         Ok(c) => c,
         Err(e) => {
-            // TODO handle early errors with response.set_error
-            std::mem::forget(response);
-            tracing::error!("{}", e);
+            response.into_error(e);
             return CResult::Error;
         }
     };
@@ -247,6 +251,7 @@ pub extern "C" fn get_stream(
             }
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
@@ -304,6 +309,7 @@ pub extern "C" fn read_from_stream(
             CResult::Ok
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
@@ -367,6 +373,7 @@ pub extern "C" fn is_end_of_stream(
             CResult::Ok
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
@@ -528,13 +535,17 @@ pub extern "C" fn put_stream(
 ) -> CResult {
     let response = unsafe { PutStreamResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
+    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let compress = match Compression::try_from(compress) {
         Ok(c) => c,
         Err(e) => {
-            // TODO handle early errors with response.set_error
-            std::mem::forget(response);
-            tracing::error!("{}", e);
+            response.into_error(e);
             return CResult::Error;
         }
     };
@@ -553,6 +564,7 @@ pub extern "C" fn put_stream(
             }
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
@@ -617,6 +629,7 @@ pub extern "C" fn write_to_stream(
             CResult::Ok
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
@@ -668,6 +681,7 @@ pub extern "C" fn shutdown_write_stream(
             CResult::Ok
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }

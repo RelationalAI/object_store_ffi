@@ -174,7 +174,13 @@ pub extern "C" fn get(
 ) -> CResult {
     let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
+    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let slice = unsafe { std::slice::from_raw_parts_mut(buffer, size) };
     let config = unsafe { & (*config) };
     match SQ.get() {
@@ -190,6 +196,7 @@ pub extern "C" fn get(
             }
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
@@ -206,7 +213,13 @@ pub extern "C" fn put(
 ) -> CResult {
     let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
+    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let slice = unsafe { std::slice::from_raw_parts(buffer, size) };
     let config = unsafe { & (*config) };
     match SQ.get() {
@@ -222,6 +235,7 @@ pub extern "C" fn put(
             }
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
@@ -236,7 +250,13 @@ pub extern "C" fn delete(
 ) -> CResult {
     let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
+    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
@@ -251,6 +271,7 @@ pub extern "C" fn delete(
             }
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }

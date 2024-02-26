@@ -175,7 +175,13 @@ pub extern "C" fn list(
 ) -> CResult {
     let response = unsafe { ListResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
-    let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
+    let prefix: Path = match Path::parse(prefix.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
@@ -190,6 +196,7 @@ pub extern "C" fn list(
             }
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
@@ -273,7 +280,13 @@ pub extern "C" fn list_stream(
 ) -> CResult {
     let response = unsafe { ListStreamResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
-    let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
+    let prefix: Path = match Path::parse(prefix.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
@@ -288,6 +301,7 @@ pub extern "C" fn list_stream(
             }
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
@@ -303,6 +317,7 @@ pub extern "C" fn next_list_stream_chunk(
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
+            std::mem::forget(response);
             tracing::error!("null stream pointer");
             return CResult::Error;
         }
@@ -337,6 +352,7 @@ pub extern "C" fn next_list_stream_chunk(
             CResult::Ok
         }
         None => {
+            std::mem::forget(response);
             return CResult::Error;
         }
     }
