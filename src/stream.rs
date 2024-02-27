@@ -242,16 +242,19 @@ pub extern "C" fn get_stream(
         Some(sq) => {
             match sq.try_send(Request::GetStream(path, size_hint, decompress, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(_)) => {
+                Err(async_channel::TrySendError::Full(Request::GetStream(_, _, _, _, response))) => {
+                    response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(_)) => {
+                Err(async_channel::TrySendError::Closed(Request::GetStream(_, _, _, _, response))) => {
+                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
+                _ => unreachable!("the response type must match")
             }
         }
         None => {
-            std::mem::forget(response);
+            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
             return CResult::Error;
         }
     }
@@ -271,8 +274,7 @@ pub extern "C" fn read_from_stream(
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
-            std::mem::forget(response);
-            tracing::error!("null stream pointer");
+            response.into_error("null stream pointer");
             return CResult::Error;
         }
     };
@@ -309,7 +311,7 @@ pub extern "C" fn read_from_stream(
             CResult::Ok
         }
         None => {
-            std::mem::forget(response);
+            response.into_error("object_store_ffi runtime not started (may be missing initialization)");
             return CResult::Error;
         }
     }
@@ -346,8 +348,7 @@ pub extern "C" fn is_end_of_stream(
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
-            std::mem::forget(response);
-            tracing::error!("null stream pointer");
+            response.into_error("null stream pointer");
             return CResult::Error;
         }
     };
@@ -373,7 +374,7 @@ pub extern "C" fn is_end_of_stream(
             CResult::Ok
         }
         None => {
-            std::mem::forget(response);
+            response.into_error("object_store_ffi runtime not started (may be missing initialization)");
             return CResult::Error;
         }
     }
@@ -555,16 +556,19 @@ pub extern "C" fn put_stream(
         Some(sq) => {
             match sq.try_send(Request::PutStream(path, compress, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(_)) => {
+                Err(async_channel::TrySendError::Full(Request::PutStream(_, _, _, response))) => {
+                    response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(_)) => {
+                Err(async_channel::TrySendError::Closed(Request::PutStream(_, _, _, response))) => {
+                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
+                _ => unreachable!("the response type must match")
             }
         }
         None => {
-            std::mem::forget(response);
+            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
             return CResult::Error;
         }
     }
@@ -593,8 +597,7 @@ pub extern "C" fn write_to_stream(
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
-            std::mem::forget(response);
-            tracing::error!("null stream pointer");
+            response.into_error("null stream pointer");
             return CResult::Error;
         }
     };
@@ -629,7 +632,7 @@ pub extern "C" fn write_to_stream(
             CResult::Ok
         }
         None => {
-            std::mem::forget(response);
+            response.into_error("object_store_ffi runtime not started (may be missing initialization)");
             return CResult::Error;
         }
     }
@@ -651,8 +654,7 @@ pub extern "C" fn shutdown_write_stream(
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
-            std::mem::forget(response);
-            tracing::error!("null stream pointer");
+            response.into_error("null stream pointer");
             return CResult::Error;
         }
     };
@@ -681,7 +683,7 @@ pub extern "C" fn shutdown_write_stream(
             CResult::Ok
         }
         None => {
-            std::mem::forget(response);
+            response.into_error("object_store_ffi runtime not started (may be missing initialization)");
             return CResult::Error;
         }
     }
