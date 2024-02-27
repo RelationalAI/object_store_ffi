@@ -174,22 +174,32 @@ pub extern "C" fn get(
 ) -> CResult {
     let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
+    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let slice = unsafe { std::slice::from_raw_parts_mut(buffer, size) };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
             match sq.try_send(Request::Get(path, slice, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(_)) => {
+                Err(async_channel::TrySendError::Full(Request::Get(_, _, _, response))) => {
+                    response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(_)) => {
+                Err(async_channel::TrySendError::Closed(Request::Get(_, _, _, response))) => {
+                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
+                _ => unreachable!("the response type must match")
             }
         }
         None => {
+            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
             return CResult::Error;
         }
     }
@@ -206,22 +216,32 @@ pub extern "C" fn put(
 ) -> CResult {
     let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
+    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let slice = unsafe { std::slice::from_raw_parts(buffer, size) };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
             match sq.try_send(Request::Put(path, slice, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(_)) => {
+                Err(async_channel::TrySendError::Full(Request::Put(_, _, _, response))) => {
+                    response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(_)) => {
+                Err(async_channel::TrySendError::Closed(Request::Put(_, _, _, response))) => {
+                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
+                _ => unreachable!("the response type must match")
             }
         }
         None => {
+            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
             return CResult::Error;
         }
     }
@@ -236,21 +256,31 @@ pub extern "C" fn delete(
 ) -> CResult {
     let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = path.to_str().expect("invalid utf8").try_into().unwrap();
+    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
             match sq.try_send(Request::Delete(path, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(_)) => {
+                Err(async_channel::TrySendError::Full(Request::Delete(_, _, response))) => {
+                    response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(_)) => {
+                Err(async_channel::TrySendError::Closed(Request::Delete(_, _, response))) => {
+                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
+                _ => unreachable!("the response type must match")
             }
         }
         None => {
+            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
             return CResult::Error;
         }
     }

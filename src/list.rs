@@ -175,21 +175,31 @@ pub extern "C" fn list(
 ) -> CResult {
     let response = unsafe { ListResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
-    let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
+    let prefix: Path = match Path::parse(prefix.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
             match sq.try_send(Request::List(prefix, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(_)) => {
+                Err(async_channel::TrySendError::Full(Request::List(_, _, response))) => {
+                    response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(_)) => {
+                Err(async_channel::TrySendError::Closed(Request::List(_, _, response))) => {
+                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
+                _ => unreachable!("the response type must match")
             }
         }
         None => {
+            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
             return CResult::Error;
         }
     }
@@ -273,21 +283,31 @@ pub extern "C" fn list_stream(
 ) -> CResult {
     let response = unsafe { ListStreamResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
-    let prefix: Path = prefix.to_str().expect("invalid utf8").try_into().unwrap();
+    let prefix: Path = match Path::parse(prefix.to_str().expect("invalid utf8")) {
+        Ok(p) => p,
+        Err(e) => {
+            response.into_error(e);
+            return CResult::Error;
+        }
+    };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
             match sq.try_send(Request::ListStream(prefix, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(_)) => {
+                Err(async_channel::TrySendError::Full(Request::ListStream(_, _, response))) => {
+                    response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(_)) => {
+                Err(async_channel::TrySendError::Closed(Request::ListStream(_, _, response))) => {
+                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
+                _ => unreachable!("the response type must match")
             }
         }
         None => {
+            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
             return CResult::Error;
         }
     }
@@ -303,7 +323,7 @@ pub extern "C" fn next_list_stream_chunk(
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
-            tracing::error!("null stream pointer");
+            response.into_error("null stream pointer");
             return CResult::Error;
         }
     };
@@ -337,6 +357,7 @@ pub extern "C" fn next_list_stream_chunk(
             CResult::Ok
         }
         None => {
+            response.into_error("object_store_ffi runtime not started (may be missing initialization)");
             return CResult::Error;
         }
     }
