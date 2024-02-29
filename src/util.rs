@@ -98,3 +98,20 @@ pub(crate) fn with_encoder(compression: Compression, writer: impl AsyncWrite + U
         }
     }
 }
+
+// Safety: This must match the layout of object_store::path::Path
+#[allow(dead_code)]
+struct RawPath {
+    raw: String,
+}
+
+// This is a workaround to create an object_store::path::Path from a String while skipping
+// validation
+pub(crate) unsafe fn cstr_to_path(cstr: &std::ffi::CStr) -> object_store::path::Path {
+    let raw_path = RawPath {
+        raw: cstr.to_str().expect("invalid utf8").to_string()
+    };
+
+    let path: object_store::path::Path = std::mem::transmute(raw_path);
+    return path;
+}

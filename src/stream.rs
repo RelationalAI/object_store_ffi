@@ -1,5 +1,5 @@
 use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, static_config, Request};
-use crate::util::{size_to_ranges, Compression, with_decoder, with_encoder};
+use crate::util::{size_to_ranges, Compression, with_decoder, with_encoder, cstr_to_path};
 use crate::error::{should_retry_logic, extract_error_info, backoff_duration_for_retry};
 
 use object_store::{path::Path, ObjectStore};
@@ -222,13 +222,7 @@ pub extern "C" fn get_stream(
 ) -> CResult {
     let response = unsafe { GetStreamResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
-        Ok(p) => p,
-        Err(e) => {
-            response.into_error(e);
-            return CResult::Error;
-        }
-    };
+    let path = unsafe{ cstr_to_path(path) };
     let decompress = match Compression::try_from(decompress) {
         Ok(c) => c,
         Err(e) => {
@@ -536,13 +530,7 @@ pub extern "C" fn put_stream(
 ) -> CResult {
     let response = unsafe { PutStreamResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path: Path = match Path::parse(path.to_str().expect("invalid utf8")) {
-        Ok(p) => p,
-        Err(e) => {
-            response.into_error(e);
-            return CResult::Error;
-        }
-    };
+    let path = unsafe{ cstr_to_path(path) };
     let compress = match Compression::try_from(compress) {
         Ok(c) => c,
         Err(e) => {
