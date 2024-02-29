@@ -1,4 +1,4 @@
-use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, Request};
+use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, Request, util::cstr_to_path};
 
 use object_store::{path::Path, ObjectStore, ObjectMeta};
 
@@ -175,13 +175,7 @@ pub extern "C" fn list(
 ) -> CResult {
     let response = unsafe { ListResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
-    let prefix: Path = match Path::parse(prefix.to_str().expect("invalid utf8")) {
-        Ok(p) => p,
-        Err(e) => {
-            response.into_error(e);
-            return CResult::Error;
-        }
-    };
+    let prefix = unsafe{ cstr_to_path(prefix) };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
@@ -283,13 +277,7 @@ pub extern "C" fn list_stream(
 ) -> CResult {
     let response = unsafe { ListStreamResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
-    let prefix: Path = match Path::parse(prefix.to_str().expect("invalid utf8")) {
-        Ok(p) => p,
-        Err(e) => {
-            response.into_error(e);
-            return CResult::Error;
-        }
-    };
+    let prefix = unsafe{ cstr_to_path(prefix) };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
