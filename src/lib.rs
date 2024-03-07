@@ -289,6 +289,10 @@ pub extern "C" fn start(
         panic_notifier.notify();
     }));
 
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "object_store_ffi=warn,object_store=warn")
+    }
+
     tracing_subscriber::fmt::init();
 
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
