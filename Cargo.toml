@@ -7,9 +7,9 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
-# # https://doc.rust-lang.org/cargo/reference/profiles.html
-# [profile.release]
-# debug = "limited"
+# https://doc.rust-lang.org/cargo/reference/profiles.html
+[profile.release]
+debug = true
 
 [dependencies]
 tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros", "signal", "time"] }
