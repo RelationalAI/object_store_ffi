@@ -2,6 +2,7 @@ use std::time::Duration;
 use backoff::backoff::Backoff;
 use once_cell::sync::Lazy;
 use crate::{Config, ConfigMeta, clients};
+use std::error::Error as StdError;
 
 // These regexes are used to extract error info from some object_store private errors.
 // We construct the regexes lazily and reuse them due to the runtime compilation cost.
@@ -88,6 +89,9 @@ pub(crate) fn extract_error_info(error: &anyhow::Error) -> ErrorInfo {
                     retries,
                     reason: ErrorReason::Timeout
                 }
+            } else if e.kind() == std::io::ErrorKind::Other && e.source().is_some() {
+                // Continue to source error
+                continue
             } else {
                 return ErrorInfo {
                     retries,
