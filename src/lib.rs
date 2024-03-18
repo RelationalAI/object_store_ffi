@@ -89,6 +89,7 @@ unsafe impl Send for Request {}
 // to link it while building this Rust lib.
 extern "C" {
     fn uv_async_send(cond: *const c_void) -> i32;
+    fn uv_is_active(cond: *const c_void) -> i32;
 }
 
 #[derive(Debug)]
@@ -99,6 +100,7 @@ pub struct Notifier {
 
 impl Notifier {
     fn notify(&self) -> i32 {
+        assert!(unsafe { uv_is_active(self.handle) } != 0);
         unsafe { uv_async_send(self.handle) }
     }
 }
@@ -254,12 +256,18 @@ trait NotifyGuard {
     fn condition_handle(&self) -> *const c_void;
     fn set_error(&mut self, error: impl std::fmt::Display);
     fn into_error(mut self, error: impl std::fmt::Display) where Self: Sized {
+        self.ensure_active();
         self.set_error(error);
     }
     unsafe fn notify(&self) {
+        self.ensure_active();
         uv_async_send(self.condition_handle());
     }
+    fn ensure_active(&self) {
+        assert!(unsafe { uv_is_active(self.condition_handle()) } != 0, "handle to the condition dropped before notification");
+    }
     fn notify_on_drop(&mut self) {
+        self.ensure_active();
         if self.is_uninitialized() {
             self.set_error("Response was dropped before being initialized, this could be due to a Rust panic");
             unsafe { self.notify() }
@@ -334,6 +342,7 @@ pub extern "C" fn start(
                 match req {
                     Request::Get(path, slice, config, response) => {
                         'retry: loop {
+                            response.ensure_active();
                             match handle_get(slice, &path, config).await {
                                 Ok(len) => {
                                     response.success(len);
@@ -355,6 +364,7 @@ pub extern "C" fn start(
                     }
                     Request::Put(path, slice, config, response) => {
                         'retry: loop {
+                            response.ensure_active();
                             match handle_put(slice, &path, config).await {
                                 Ok(len) => {
                                     response.success(len);
@@ -376,6 +386,7 @@ pub extern "C" fn start(
                     }
                     Request::Delete(path, config, response) => {
                         'retry: loop {
+                            response.ensure_active();
                             match handle_delete(&path, config).await {
                                 Ok(()) => {
                                     response.success(0);
@@ -397,6 +408,7 @@ pub extern "C" fn start(
                     }
                     Request::List(prefix, config, response) => {
                         'retry: loop {
+                            response.ensure_active();
                             match handle_list(&prefix, config).await {
                                 Ok(entries) => {
                                     response.success(entries);
@@ -418,6 +430,7 @@ pub extern "C" fn start(
                     }
                     Request::ListStream(prefix, config, response) => {
                         'retry: loop {
+                            response.ensure_active();
                             match handle_list_stream(&prefix, config).await {
                                 Ok(stream) => {
                                     response.success(stream);
@@ -439,6 +452,7 @@ pub extern "C" fn start(
                     }
                     Request::GetStream(path, size_hint, compression, config, response) => {
                         'retry: loop {
+                            response.ensure_active();
                             match handle_get_stream(&path, size_hint, compression, config).await {
                                 Ok((stream, full_size)) => {
                                     response.success(stream, full_size);
@@ -460,6 +474,7 @@ pub extern "C" fn start(
                     }
                     Request::PutStream(path, compression, config, response) => {
                         'retry: loop {
+                            response.ensure_active();
                             match handle_put_stream(&path, compression, config).await {
                                 Ok(stream) => {
                                     response.success(stream);
