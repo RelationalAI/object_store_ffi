@@ -1,4 +1,4 @@
-use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, Request, util::cstr_to_path};
+use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, Request, util::cstr_to_path, Context, RawResponse, ResponseGuard, with_cancellation};
 
 use object_store::{path::Path, ObjectStore, ObjectMeta};
 
@@ -56,65 +56,45 @@ pub struct ListResponse {
     result: CResult,
     entries: *const ListEntry,
     entry_count: u64,
-    error_message: *mut c_char
+    error_message: *mut c_char,
+    context: *const Context
 }
 
 unsafe impl Send for ListResponse {}
 
-// RAII Guard for a ListResponse that ensures the awaiting Julia task will be notified
-// even if this is dropped on a panic.
-pub struct ListResponseGuard {
-    response: &'static mut ListResponse,
-    handle: *const c_void
-}
-
-impl NotifyGuard for ListResponseGuard {
-    fn is_uninitialized(&self) -> bool {
-        self.response.result == CResult::Uninitialized
+impl RawResponse for ListResponse {
+    type Payload = Vec<ObjectMeta>;
+    fn result_mut(&mut self) -> &mut CResult {
+        &mut self.result
     }
-    fn condition_handle(&self) -> *const c_void {
-        self.handle
+    fn context_mut(&mut self) -> &mut *const Context {
+        &mut self.context
     }
-    fn set_error(&mut self, error: impl std::fmt::Display) {
-        self.response.result = CResult::Error;
-        self.response.entries = std::ptr::null();
-        self.response.entry_count = 0;
-        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.response.error_message = c_string.into_raw();
+    fn error_message_mut(&mut self) -> &mut *mut c_char {
+        &mut self.error_message
     }
-}
+    fn set_payload(&mut self, payload: Option<Self::Payload>) {
+        match payload {
+            Some(entries) => {
+                let entries_slice = entries.into_iter()
+                    .map(Into::into)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
 
-impl ListResponseGuard {
-    unsafe fn new(response_ptr: *mut ListResponse, handle: *const c_void) -> ListResponseGuard {
-        let response = unsafe { &mut (*response_ptr) };
-        response.result = CResult::Uninitialized;
+                let entry_count = entries_slice.len() as u64;
+                let entries_ptr = entries_slice.as_ptr();
+                std::mem::forget(entries_slice);
 
-        ListResponseGuard { response, handle }
-    }
-    pub(crate) fn success(self, entries: Vec<ObjectMeta>) {
-        let entries_slice = entries.into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let entry_count = entries_slice.len() as u64;
-        let entries_ptr = entries_slice.as_ptr();
-        std::mem::forget(entries_slice);
-
-        self.response.result = CResult::Ok;
-        self.response.entry_count = entry_count;
-        self.response.entries = entries_ptr;
-        self.response.error_message = std::ptr::null_mut();
+                self.entry_count = entry_count;
+                self.entries = entries_ptr;
+            }
+            None => {
+                self.entries = std::ptr::null();
+                self.entry_count = 0;
+            }
+        }
     }
 }
-
-impl Drop for ListResponseGuard {
-    fn drop(&mut self) {
-        self.notify_on_drop()
-    }
-}
-
-unsafe impl Send for ListResponseGuard {}
 
 #[no_mangle]
 pub extern "C" fn destroy_list_entries(
@@ -173,7 +153,7 @@ pub extern "C" fn list(
     response: *mut ListResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { ListResponseGuard::new(response, handle) };
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
     let prefix = unsafe{ cstr_to_path(prefix) };
     let config = unsafe { & (*config) };
@@ -219,54 +199,34 @@ pub extern "C" fn destroy_list_stream(
 pub struct ListStreamResponse {
     result: CResult,
     stream: *mut StreamWrapper,
-    error_message: *mut c_char
+    error_message: *mut c_char,
+    context: *const Context
 }
 
 unsafe impl Send for ListStreamResponse {}
 
-// RAII Guard for a ListResponse that ensures the awaiting Julia task will be notified
-// even if this is dropped on a panic.
-pub struct ListStreamResponseGuard {
-    response: &'static mut ListStreamResponse,
-    handle: *const c_void
-}
-
-impl NotifyGuard for ListStreamResponseGuard {
-    fn is_uninitialized(&self) -> bool {
-        self.response.result == CResult::Uninitialized
+impl RawResponse for ListStreamResponse {
+    type Payload = Box<StreamWrapper>;
+    fn result_mut(&mut self) -> &mut CResult {
+        &mut self.result
     }
-    fn condition_handle(&self) -> *const c_void {
-        self.handle
+    fn context_mut(&mut self) -> &mut *const Context {
+        &mut self.context
     }
-    fn set_error(&mut self, error: impl std::fmt::Display) {
-        self.response.result = CResult::Error;
-        self.response.stream = std::ptr::null_mut();
-        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.response.error_message = c_string.into_raw();
+    fn error_message_mut(&mut self) -> &mut *mut c_char {
+        &mut self.error_message
     }
-}
-
-impl ListStreamResponseGuard {
-    unsafe fn new(response_ptr: *mut ListStreamResponse, handle: *const c_void) -> ListStreamResponseGuard {
-        let response = unsafe { &mut (*response_ptr) };
-        response.result = CResult::Uninitialized;
-
-        ListStreamResponseGuard { response, handle }
-    }
-    pub(crate) fn success(self, stream: Box<StreamWrapper>) {
-        self.response.result = CResult::Ok;
-        self.response.stream = Box::into_raw(stream);
-        self.response.error_message = std::ptr::null_mut();
+    fn set_payload(&mut self, payload: Option<Self::Payload>) {
+        match payload {
+            Some(stream) => {
+                self.stream = Box::into_raw(stream);
+            }
+            None => {
+                self.stream = std::ptr::null_mut();
+            }
+        }
     }
 }
-
-impl Drop for ListStreamResponseGuard {
-    fn drop(&mut self) {
-        self.notify_on_drop()
-    }
-}
-
-unsafe impl Send for ListStreamResponseGuard {}
 
 #[no_mangle]
 pub extern "C" fn list_stream(
@@ -275,7 +235,7 @@ pub extern "C" fn list_stream(
     response: *mut ListStreamResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { ListStreamResponseGuard::new(response, handle) };
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
     let prefix = unsafe{ cstr_to_path(prefix) };
     let config = unsafe { & (*config) };
@@ -307,7 +267,7 @@ pub extern "C" fn next_list_stream_chunk(
     response: *mut ListResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { ListResponseGuard::new(response, handle) };
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
@@ -332,15 +292,7 @@ pub extern "C" fn next_list_stream_chunk(
                     Ok::<_, anyhow::Error>(option)
                 };
 
-                match list_op.await {
-                    Ok(entries) => {
-                        response.success(entries);
-                    },
-                    Err(e) => {
-                        tracing::warn!("{}", e);
-                        response.into_error(e);
-                    }
-                }
+                with_cancellation!(list_op, response);
             });
             CResult::Ok
         }

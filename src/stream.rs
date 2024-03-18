@@ -1,6 +1,7 @@
-use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, static_config, Request};
+use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, static_config, Request, Context, RawResponse, ResponseGuard};
 use crate::util::{size_to_ranges, Compression, with_decoder, with_encoder, cstr_to_path};
 use crate::error::{should_retry_logic, extract_error_info, backoff_duration_for_retry};
+use crate::with_cancellation;
 
 use object_store::{path::Path, ObjectStore};
 
@@ -9,7 +10,7 @@ use bytes::Buf;
 use tokio_util::io::StreamReader;
 use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncWrite, AsyncBufReadExt};
 use anyhow::anyhow;
-use std::ffi::{c_char, c_void, CString, c_longlong};
+use std::ffi::{c_char, c_void, c_longlong};
 use futures_util::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
@@ -91,56 +92,36 @@ pub struct ReadResponse {
     result: CResult,
     length: usize,
     eof: bool,
-    error_message: *mut c_char
+    error_message: *mut c_char,
+    context: *const Context,
 }
 
 unsafe impl Send for ReadResponse {}
 
-// RAII Guard for a ReadResponse that ensures the awaiting Julia task will be notified
-// even if this is dropped on a panic.
-pub struct ReadResponseGuard {
-    response: &'static mut ReadResponse,
-    handle: *const c_void
-}
-
-impl NotifyGuard for ReadResponseGuard {
-    fn is_uninitialized(&self) -> bool {
-        self.response.result == CResult::Uninitialized
+impl RawResponse for ReadResponse {
+    type Payload = (usize, bool);
+    fn result_mut(&mut self) -> &mut CResult {
+        &mut self.result
     }
-    fn condition_handle(&self) -> *const c_void {
-        self.handle
+    fn context_mut(&mut self) -> &mut *const Context {
+        &mut self.context
     }
-    fn set_error(&mut self, error: impl std::fmt::Display) {
-        self.response.result = CResult::Error;
-        self.response.length = 0;
-        self.response.eof = false;
-        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.response.error_message = c_string.into_raw();
+    fn error_message_mut(&mut self) -> &mut *mut c_char {
+        &mut self.error_message
     }
-}
-
-impl ReadResponseGuard {
-    unsafe fn new(response_ptr: *mut ReadResponse, handle: *const c_void) -> ReadResponseGuard {
-        let response = unsafe { &mut (*response_ptr) };
-        response.result = CResult::Uninitialized;
-
-        ReadResponseGuard { response, handle }
-    }
-    pub(crate) fn success(self, length: usize, eof: bool) {
-        self.response.result = CResult::Ok;
-        self.response.length = length;
-        self.response.eof = eof;
-        self.response.error_message = std::ptr::null_mut();
+    fn set_payload(&mut self, payload: Option<Self::Payload>) {
+        match payload {
+            Some((length, eof)) => {
+                self.length = length;
+                self.eof = eof;
+            }
+            None => {
+                self.length = 0;
+                self.eof = false;
+            }
+        }
     }
 }
-
-impl Drop for ReadResponseGuard {
-    fn drop(&mut self) {
-        self.notify_on_drop()
-    }
-}
-
-unsafe impl Send for ReadResponseGuard {}
 
 pub struct ReadStream {
     reader: tokio::io::BufReader<Box<dyn AsyncRead + Unpin + Send>>
@@ -160,56 +141,36 @@ pub struct GetStreamResponse {
     result: CResult,
     stream: *mut ReadStream,
     object_size: u64,
-    error_message: *mut c_char
+    error_message: *mut c_char,
+    context: *const Context
 }
 
 unsafe impl Send for GetStreamResponse {}
 
-// RAII Guard for a GetStreamResponse that ensures the awaiting Julia task will be notified
-// even if this is dropped on a panic.
-pub struct GetStreamResponseGuard {
-    response: &'static mut GetStreamResponse,
-    handle: *const c_void
-}
-
-impl NotifyGuard for GetStreamResponseGuard {
-    fn is_uninitialized(&self) -> bool {
-        self.response.result == CResult::Uninitialized
+impl RawResponse for GetStreamResponse {
+    type Payload = (Box<ReadStream>, usize);
+    fn result_mut(&mut self) -> &mut CResult {
+        &mut self.result
     }
-    fn condition_handle(&self) -> *const c_void {
-        self.handle
+    fn context_mut(&mut self) -> &mut *const Context {
+        &mut self.context
     }
-    fn set_error(&mut self, error: impl std::fmt::Display) {
-        self.response.result = CResult::Error;
-        self.response.stream = std::ptr::null_mut();
-        self.response.object_size = 0;
-        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.response.error_message = c_string.into_raw();
+    fn error_message_mut(&mut self) -> &mut *mut c_char {
+        &mut self.error_message
     }
-}
-
-impl GetStreamResponseGuard {
-    unsafe fn new(response_ptr: *mut GetStreamResponse, handle: *const c_void) -> GetStreamResponseGuard {
-        let response = unsafe { &mut (*response_ptr) };
-        response.result = CResult::Uninitialized;
-
-        GetStreamResponseGuard { response, handle }
-    }
-    pub(crate) fn success(self, stream: Box<ReadStream>, object_size: usize) {
-        self.response.result = CResult::Ok;
-        self.response.stream = Box::into_raw(stream);
-        self.response.object_size = object_size as u64;
-        self.response.error_message = std::ptr::null_mut();
+    fn set_payload(&mut self, payload: Option<Self::Payload>) {
+        match payload {
+            Some((stream, object_size)) => {
+                self.stream = Box::into_raw(stream);
+                self.object_size = object_size as u64;
+            }
+            None => {
+                self.stream = std::ptr::null_mut();
+                self.object_size = 0;
+            }
+        }
     }
 }
-
-impl Drop for GetStreamResponseGuard {
-    fn drop(&mut self) {
-        self.notify_on_drop()
-    }
-}
-
-unsafe impl Send for GetStreamResponseGuard {}
 
 #[no_mangle]
 pub extern "C" fn get_stream(
@@ -220,7 +181,7 @@ pub extern "C" fn get_stream(
     response: *mut GetStreamResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { GetStreamResponseGuard::new(response, handle) };
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
     let path = unsafe{ cstr_to_path(path) };
     let decompress = match Compression::try_from(decompress) {
@@ -263,7 +224,7 @@ pub extern "C" fn read_from_stream(
     response: *mut ReadResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { ReadResponseGuard::new(response, handle) };
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let mut slice = unsafe { std::slice::from_raw_parts_mut(buffer, size) };
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
@@ -292,15 +253,7 @@ pub extern "C" fn read_from_stream(
                     Ok::<_, anyhow::Error>((bytes_read, false))
                 };
 
-                match read_op.await {
-                    Ok((bytes_read, eof)) => {
-                        response.success(bytes_read, eof);
-                    },
-                    Err(e) => {
-                        tracing::warn!("{}", e);
-                        response.into_error(e);
-                    }
-                }
+                with_cancellation!(read_op, response);
             });
             CResult::Ok
         }
@@ -338,7 +291,7 @@ pub extern "C" fn is_end_of_stream(
     response: *mut ReadResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { ReadResponseGuard::new(response, handle) };
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
@@ -350,20 +303,18 @@ pub extern "C" fn is_end_of_stream(
     match RT.get() {
         Some(runtime) => {
             runtime.spawn(async move {
-                match wrapper.reader.fill_buf().await {
-                    Ok(buffer) => {
+                let eof_op = async {
+                    let (bytes_read, eof) = wrapper.reader.fill_buf().await.map(|buffer| {
                         if buffer.is_empty() {
-                            // reached EOF
-                            response.success(0, true);
+                            (0, true)
                         } else {
-                            response.success(buffer.len(), false)
+                            (buffer.len(), false)
                         }
-                    },
-                    Err(e) => {
-                        tracing::warn!("{}", e);
-                        response.into_error(e);
-                    }
-                }
+                    })?;
+                    Ok::<_, anyhow::Error>((bytes_read, eof))
+                };
+
+                with_cancellation!(eof_op, response);
             });
             CResult::Ok
         }
@@ -378,54 +329,34 @@ pub extern "C" fn is_end_of_stream(
 pub struct WriteResponse {
     result: CResult,
     length: usize,
-    error_message: *mut c_char
+    error_message: *mut c_char,
+    context: *const Context,
 }
 
 unsafe impl Send for WriteResponse {}
 
-// RAII Guard for a WriteResponse that ensures the awaiting Julia task will be notified
-// even if this is dropped on a panic.
-pub struct WriteResponseGuard {
-    response: &'static mut WriteResponse,
-    handle: *const c_void
-}
-
-impl NotifyGuard for WriteResponseGuard {
-    fn is_uninitialized(&self) -> bool {
-        self.response.result == CResult::Uninitialized
+impl RawResponse for WriteResponse {
+    type Payload = usize;
+    fn result_mut(&mut self) -> &mut CResult {
+        &mut self.result
     }
-    fn condition_handle(&self) -> *const c_void {
-        self.handle
+    fn context_mut(&mut self) -> &mut *const Context {
+        &mut self.context
     }
-    fn set_error(&mut self, error: impl std::fmt::Display) {
-        self.response.result = CResult::Error;
-        self.response.length = 0;
-        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.response.error_message = c_string.into_raw();
+    fn error_message_mut(&mut self) -> &mut *mut c_char {
+        &mut self.error_message
     }
-}
-
-impl WriteResponseGuard {
-    unsafe fn new(response_ptr: *mut WriteResponse, handle: *const c_void) -> WriteResponseGuard {
-        let response = unsafe { &mut (*response_ptr) };
-        response.result = CResult::Uninitialized;
-
-        WriteResponseGuard { response, handle }
-    }
-    pub(crate) fn success(self, length: usize) {
-        self.response.result = CResult::Ok;
-        self.response.length = length;
-        self.response.error_message = std::ptr::null_mut();
+    fn set_payload(&mut self, payload: Option<Self::Payload>) {
+        match payload {
+            Some(length) => {
+                self.length = length;
+            }
+            None => {
+                self.length = 0;
+            }
+        }
     }
 }
-
-impl Drop for WriteResponseGuard {
-    fn drop(&mut self) {
-        self.notify_on_drop()
-    }
-}
-
-unsafe impl Send for WriteResponseGuard {}
 
 struct UploadState {
     client: Arc<dyn ObjectStore>,
@@ -459,54 +390,34 @@ pub extern "C" fn destroy_write_stream(
 pub struct PutStreamResponse {
     result: CResult,
     stream: *mut WriteStream,
-    error_message: *mut c_char
+    error_message: *mut c_char,
+    context: *const Context
 }
 
 unsafe impl Send for PutStreamResponse {}
 
-// RAII Guard for a PutStreamResponse that ensures the awaiting Julia task will be notified
-// even if this is dropped on a panic.
-pub struct PutStreamResponseGuard {
-    response: &'static mut PutStreamResponse,
-    handle: *const c_void
-}
-
-impl NotifyGuard for PutStreamResponseGuard {
-    fn is_uninitialized(&self) -> bool {
-        self.response.result == CResult::Uninitialized
+impl RawResponse for PutStreamResponse {
+    type Payload = Box<WriteStream>;
+    fn result_mut(&mut self) -> &mut CResult {
+        &mut self.result
     }
-    fn condition_handle(&self) -> *const c_void {
-        self.handle
+    fn context_mut(&mut self) -> &mut *const Context {
+        &mut self.context
     }
-    fn set_error(&mut self, error: impl std::fmt::Display) {
-        self.response.result = CResult::Error;
-        self.response.stream = std::ptr::null_mut();
-        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.response.error_message = c_string.into_raw();
+    fn error_message_mut(&mut self) -> &mut *mut c_char {
+        &mut self.error_message
     }
-}
-
-impl PutStreamResponseGuard {
-    unsafe fn new(response_ptr: *mut PutStreamResponse, handle: *const c_void) -> PutStreamResponseGuard {
-        let response = unsafe { &mut (*response_ptr) };
-        response.result = CResult::Uninitialized;
-
-        PutStreamResponseGuard { response, handle }
-    }
-    pub(crate) fn success(self, stream: Box<WriteStream>) {
-        self.response.result = CResult::Ok;
-        self.response.stream = Box::into_raw(stream);
-        self.response.error_message = std::ptr::null_mut();
+    fn set_payload(&mut self, payload: Option<Self::Payload>) {
+        match payload {
+            Some(stream) => {
+                self.stream = Box::into_raw(stream);
+            }
+            None => {
+                self.stream = std::ptr::null_mut();
+            }
+        }
     }
 }
-
-impl Drop for PutStreamResponseGuard {
-    fn drop(&mut self) {
-        self.notify_on_drop()
-    }
-}
-
-unsafe impl Send for PutStreamResponseGuard {}
 
 // Creates a `WriteStream` that splits the written data into parts and uploads them
 // concurrently to form a single object.
@@ -528,7 +439,7 @@ pub extern "C" fn put_stream(
     response: *mut PutStreamResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { PutStreamResponseGuard::new(response, handle) };
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
     let path = unsafe{ cstr_to_path(path) };
     let compress = match Compression::try_from(compress) {
@@ -576,7 +487,7 @@ pub extern "C" fn write_to_stream(
     response: *mut WriteResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { WriteResponseGuard::new(response, handle) };
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let mut slice = if buffer.is_null() && size == 0 {
         unsafe { std::slice::from_raw_parts(std::ptr::NonNull::dangling().as_ptr(), 0) }
     } else {
@@ -604,18 +515,7 @@ pub extern "C" fn write_to_stream(
                     Ok::<_, anyhow::Error>(bytes_written)
                 };
 
-                match write_op.await {
-                    Ok(bytes_written) => {
-                        response.success(bytes_written);
-                    },
-                    Err(e) => {
-                        tracing::warn!("{}", e);
-                        if let Some(upload) = wrapper.upload.as_ref() {
-                            upload.cleanup().await;
-                        }
-                        response.into_error(e);
-                    }
-                }
+                with_cancellation!(write_op, response);
             });
             CResult::Ok
         }
@@ -638,7 +538,7 @@ pub extern "C" fn shutdown_write_stream(
     response: *mut WriteResponse,
     handle: *const c_void
 ) -> CResult {
-    let response = unsafe { WriteResponseGuard::new(response, handle) };
+    let response = unsafe { ResponseGuard::new(response, handle) };
     let wrapper = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
@@ -652,19 +552,30 @@ pub extern "C" fn shutdown_write_stream(
             runtime.spawn(async move {
                 let shutdown_op = async {
                     wrapper.writer.shutdown().await?;
-                    Ok::<_, anyhow::Error>(())
+                    Ok::<_, anyhow::Error>(0)
                 };
 
-                match shutdown_op.await {
-                    Ok(_) => {
-                        response.success(0);
-                    },
-                    Err(e) => {
-                        tracing::warn!("{}", e);
+                // Manual cancellation due to cleanup
+                tokio::select! {
+                    _ = response.cancelled() => {
+                        tracing::warn!("operation was cancelled");
                         if let Some(upload) = wrapper.upload.as_ref() {
                             upload.cleanup().await;
                         }
-                        response.into_error(e);
+                        response.into_error("operation was cancelled");
+                        return;
+                    }
+                    res = shutdown_op => match res {
+                        Ok(v) => {
+                            response.success(v);
+                        },
+                        Err(e) => {
+                            tracing::warn!("{}", e);
+                            if let Some(upload) = wrapper.upload.as_ref() {
+                                upload.cleanup().await;
+                            }
+                            response.into_error(e);
+                        }
                     }
                 }
             });
