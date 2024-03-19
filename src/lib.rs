@@ -2,8 +2,9 @@ use futures_util::StreamExt;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_void, CString};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::anyhow;
@@ -22,13 +23,13 @@ mod error;
 use error::{extract_error_info, should_retry};
 
 mod list;
-use list::{handle_list, handle_list_stream, ListResponseGuard, ListStreamResponseGuard};
+use list::{handle_list, handle_list_stream, ListResponse, ListStreamResponse};
 
 mod crud_ops;
-use crud_ops::{handle_get, handle_put, handle_delete, ResponseGuard};
+use crud_ops::{handle_get, handle_put, handle_delete, Response};
 
 mod stream;
-use stream::{handle_get_stream, handle_put_stream, GetStreamResponseGuard, PutStreamResponseGuard};
+use stream::{handle_get_stream, handle_put_stream, GetStreamResponse, PutStreamResponse};
 
 // Our global variables needed by our library at runtime. Note that we follow Rust's
 // safety rules here by making them immutable with write-exactly-once semantics using
@@ -60,25 +61,93 @@ fn static_config() -> &'static StaticConfig {
 // The result type used for the API functions exposed to Julia. This is used for both
 // synchronous errors, e.g. our dispatch channel is full, and for async errors such
 // as HTTP connection errors as part of the async Response.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Default)]
 #[repr(C)]
 pub enum CResult {
+    #[default]
     Uninitialized = -1,
     Ok = 0,
     Error = 1,
     Backoff = 2,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Context {
+    cancellation_token: CancellationToken
+}
+
+#[no_mangle]
+pub extern "C" fn cancel_context(ctx_ptr: *const Context) -> CResult {
+    let ctx = unsafe { &*ctx_ptr };
+    ctx.cancellation_token.cancel();
+    CResult::Ok
+}
+
+pub trait RawResponse {
+    type Payload;
+    fn result_mut(&mut self) -> &mut CResult;
+    fn context_mut(&mut self) -> &mut *const Context;
+    fn error_message_mut(&mut self) -> &mut *mut c_char;
+    fn set_payload(&mut self, payload: Option<Self::Payload>);
+}
+
+struct ResponseGuard<T: RawResponse + 'static> {
+    response: &'static mut T,
+    context: Arc<Context>,
+    handle: *const c_void
+}
+
+impl<T: RawResponse> ResponseGuard<T> {
+    unsafe fn new(response_ptr: *mut T, handle: *const c_void) -> Self {
+        let response = unsafe { &mut (*response_ptr) };
+        *response.result_mut() = CResult::Uninitialized;
+        let context = Arc::new(Context::default());
+        *response.context_mut() = Arc::into_raw(context.clone());
+        ResponseGuard { response, context, handle }
+    }
+    pub(crate) fn success(self, payload: T::Payload) {
+        *self.response.result_mut() = CResult::Ok;
+        self.response.set_payload(Some(payload));
+        *self.response.error_message_mut() = std::ptr::null_mut();
+    }
+}
+
+impl<T: RawResponse> NotifyGuard for ResponseGuard<T> {
+    fn is_uninitialized(&mut self) -> bool {
+        *self.response.result_mut() == CResult::Uninitialized
+    }
+    fn condition_handle(&self) -> *const c_void {
+        self.handle
+    }
+    fn context(&self) -> &Context {
+        &self.context
+    }
+    fn set_error(&mut self, error: impl std::fmt::Display) {
+        *self.response.result_mut() = CResult::Error;
+        self.response.set_payload(None);
+        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
+        *self.response.error_message_mut() = c_string.into_raw();
+    }
+}
+
+impl<T: RawResponse> Drop for ResponseGuard<T> {
+    fn drop(&mut self) {
+        self.notify_on_drop()
+    }
+}
+
+unsafe impl<T: RawResponse> Send for ResponseGuard<T> {}
+
 // The types used for our internal dispatch mechanism, for dispatching Julia requests
 // to our worker task.
 enum Request {
-    Get(Path, &'static mut [u8], &'static Config, ResponseGuard),
-    Put(Path, &'static [u8], &'static Config, ResponseGuard),
-    Delete(Path, &'static Config, ResponseGuard),
-    List(Path, &'static Config, ListResponseGuard),
-    ListStream(Path, &'static Config, ListStreamResponseGuard),
-    GetStream(Path, usize, Compression, &'static Config, GetStreamResponseGuard),
-    PutStream(Path, Compression, &'static Config, PutStreamResponseGuard)
+    Get(Path, &'static mut [u8], &'static Config, ResponseGuard<Response>),
+    Put(Path, &'static [u8], &'static Config, ResponseGuard<Response>),
+    Delete(Path, &'static Config, ResponseGuard<Response>),
+    List(Path, &'static Config, ResponseGuard<ListResponse>),
+    ListStream(Path, &'static Config, ResponseGuard<ListStreamResponse>),
+    GetStream(Path, usize, Compression, &'static Config, ResponseGuard<GetStreamResponse>),
+    PutStream(Path, Compression, &'static Config, ResponseGuard<PutStreamResponse>)
 }
 
 unsafe impl Send for Request {}
@@ -251,10 +320,77 @@ impl Default for StaticConfig {
     }
 }
 
+macro_rules! with_retries_and_cancellation {
+    ($op:expr, $response:expr, $config: expr) => {
+        let start_instant = Instant::now();
+        let mut retries = 0;
+        'retry: loop {
+            $response.ensure_active();
+            tokio::select! {
+                _ = $response.cancelled() => {
+                    tracing::warn!("operation was cancelled");
+                    $response.into_error("operation was cancelled");
+                    return;
+                }
+                res = $op => {
+                    match res {
+                        Ok(v) => {
+                            $response.success(v);
+                            return;
+                        }
+                        Err(e) => {
+                            if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), $config).await {
+                                retries += 1;
+                                tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
+                                tokio::time::sleep(duration).await;
+                                continue 'retry;
+                            }
+                            tracing::warn!("{}", e);
+                            $response.into_error(e);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! with_cancellation {
+    ($op:expr, $response:expr) => {
+        $response.ensure_active();
+        tokio::select! {
+            _ = $response.cancelled() => {
+                tracing::warn!("operation was cancelled");
+                $response.into_error("operation was cancelled");
+                return;
+            }
+            res = $op => match res {
+                Ok(v) => {
+                    $response.success(v);
+                },
+                Err(e) => {
+                    tracing::warn!("{}", e);
+                    $response.into_error(e);
+                }
+            }
+        }
+    };
+}
+
+
 trait NotifyGuard {
-    fn is_uninitialized(&self) -> bool;
+    fn is_uninitialized(&mut self) -> bool;
     fn condition_handle(&self) -> *const c_void;
+    fn context(&self) -> &Context {
+        unimplemented!("missing context");
+    }
     fn set_error(&mut self, error: impl std::fmt::Display);
+
+    fn cancelled(&self) -> WaitForCancellationFuture {
+        self.context().cancellation_token.cancelled()
+    }
     fn into_error(mut self, error: impl std::fmt::Display) where Self: Sized {
         self.ensure_active();
         self.set_error(error);
@@ -337,162 +473,55 @@ pub extern "C" fn start(
 
         rx.map(|req| {
             async {
-                let start_instant = Instant::now();
-                let mut retries = 0;
                 match req {
                     Request::Get(path, slice, config, response) => {
-                        'retry: loop {
-                            response.ensure_active();
-                            match handle_get(slice, &path, config).await {
-                                Ok(len) => {
-                                    response.success(len);
-                                    return;
-                                }
-                                Err(e) => {
-                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
-                                        retries += 1;
-                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                        tokio::time::sleep(duration).await;
-                                        continue 'retry;
-                                    }
-                                    tracing::warn!("{}", e);
-                                    response.into_error(e);
-                                    return;
-                                }
-                            }
-                        }
+                        with_retries_and_cancellation!(
+                            handle_get(slice, &path, config),
+                            response,
+                            config
+                        );
                     }
                     Request::Put(path, slice, config, response) => {
-                        'retry: loop {
-                            response.ensure_active();
-                            match handle_put(slice, &path, config).await {
-                                Ok(len) => {
-                                    response.success(len);
-                                    return;
-                                }
-                                Err(e) => {
-                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
-                                        retries += 1;
-                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                        tokio::time::sleep(duration).await;
-                                        continue 'retry;
-                                    }
-                                    tracing::warn!("{}", e);
-                                    response.into_error(e);
-                                    return;
-                                }
-                            }
-                        }
+                        with_retries_and_cancellation!(
+                            handle_put(slice, &path, config),
+                            response,
+                            config
+                        );
                     }
                     Request::Delete(path, config, response) => {
-                        'retry: loop {
-                            response.ensure_active();
-                            match handle_delete(&path, config).await {
-                                Ok(()) => {
-                                    response.success(0);
-                                    return;
-                                }
-                                Err(e) => {
-                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
-                                        retries += 1;
-                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                        tokio::time::sleep(duration).await;
-                                        continue 'retry;
-                                    }
-                                    tracing::warn!("{}", e);
-                                    response.into_error(e);
-                                    return;
-                                }
-                            }
-                        }
+                        with_retries_and_cancellation!(
+                            handle_delete(&path, config),
+                            response,
+                            config
+                        );
                     }
                     Request::List(prefix, config, response) => {
-                        'retry: loop {
-                            response.ensure_active();
-                            match handle_list(&prefix, config).await {
-                                Ok(entries) => {
-                                    response.success(entries);
-                                    return;
-                                }
-                                Err(e) => {
-                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
-                                        retries += 1;
-                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                        tokio::time::sleep(duration).await;
-                                        continue 'retry;
-                                    }
-                                    tracing::warn!("{}", e);
-                                    response.into_error(e);
-                                    return;
-                                }
-                            }
-                        }
+                        with_retries_and_cancellation!(
+                            handle_list(&prefix, config),
+                            response,
+                            config
+                        );
                     }
                     Request::ListStream(prefix, config, response) => {
-                        'retry: loop {
-                            response.ensure_active();
-                            match handle_list_stream(&prefix, config).await {
-                                Ok(stream) => {
-                                    response.success(stream);
-                                    return;
-                                }
-                                Err(e) => {
-                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
-                                        retries += 1;
-                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                        tokio::time::sleep(duration).await;
-                                        continue 'retry;
-                                    }
-                                    tracing::warn!("{}", e);
-                                    response.into_error(e);
-                                    return;
-                                }
-                            }
-                        }
+                        with_retries_and_cancellation!(
+                            handle_list_stream(&prefix, config),
+                            response,
+                            config
+                        );
                     }
                     Request::GetStream(path, size_hint, compression, config, response) => {
-                        'retry: loop {
-                            response.ensure_active();
-                            match handle_get_stream(&path, size_hint, compression, config).await {
-                                Ok((stream, full_size)) => {
-                                    response.success(stream, full_size);
-                                    return;
-                                }
-                                Err(e) => {
-                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
-                                        retries += 1;
-                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                        tokio::time::sleep(duration).await;
-                                        continue 'retry;
-                                    }
-                                    tracing::warn!("{}", e);
-                                    response.into_error(e);
-                                    return;
-                                }
-                            }
-                        }
+                        with_retries_and_cancellation!(
+                            handle_get_stream(&path, size_hint, compression, config),
+                            response,
+                            config
+                        );
                     }
                     Request::PutStream(path, compression, config, response) => {
-                        'retry: loop {
-                            response.ensure_active();
-                            match handle_put_stream(&path, compression, config).await {
-                                Ok(stream) => {
-                                    response.success(stream);
-                                    return;
-                                }
-                                Err(e) => {
-                                    if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), config).await {
-                                        retries += 1;
-                                        tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                        tokio::time::sleep(duration).await;
-                                        continue 'retry;
-                                    }
-                                    tracing::warn!("{}", e);
-                                    response.into_error(e);
-                                    return;
-                                }
-                            }
-                        }
+                        with_retries_and_cancellation!(
+                            handle_put_stream(&path, compression, config),
+                            response,
+                            config
+                        );
                     }
                 }
             }
@@ -505,6 +534,13 @@ pub extern "C" fn start(
 pub extern "C" fn destroy_cstring(string: *mut c_char) -> CResult {
     let string = unsafe { std::ffi::CString::from_raw(string) };
     drop(string);
+    CResult::Ok
+}
+
+#[no_mangle]
+pub extern "C" fn destroy_context(ctx_ptr: *const Context) -> CResult {
+    let ctx = unsafe { Arc::from_raw(ctx_ptr) };
+    drop(ctx);
     CResult::Ok
 }
 

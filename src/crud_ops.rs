@@ -1,55 +1,11 @@
-use crate::{CResult, Config, NotifyGuard, SQ, clients, dyn_connect, static_config, Request, util::cstr_to_path};
+use crate::{CResult, Config, NotifyGuard, SQ, clients, dyn_connect, static_config, Request, util::cstr_to_path, Context, RawResponse, ResponseGuard};
 
 use object_store::{path::Path, ObjectStore};
 
 use anyhow::anyhow;
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_void};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
-
-// RAII Guard for a Response that ensures the awaiting Julia task will be notified
-// even if this is dropped on a panic.
-pub struct ResponseGuard {
-    response: &'static mut Response,
-    handle: *const c_void
-}
-
-impl NotifyGuard for ResponseGuard {
-    fn is_uninitialized(&self) -> bool {
-        self.response.result == CResult::Uninitialized
-    }
-    fn condition_handle(&self) -> *const c_void {
-        self.handle
-    }
-    fn set_error(&mut self, error: impl std::fmt::Display) {
-        self.response.result = CResult::Error;
-        self.response.length = 0;
-        let c_string = CString::new(format!("{}", error)).expect("should not have nulls");
-        self.response.error_message = c_string.into_raw();
-    }
-}
-
-impl ResponseGuard {
-    unsafe fn new(response_ptr: *mut Response, handle: *const c_void) -> ResponseGuard {
-        let response = unsafe { &mut (*response_ptr) };
-        response.result = CResult::Uninitialized;
-
-        ResponseGuard { response, handle }
-    }
-    pub(crate) fn success(self, length: usize) {
-        self.response.result = CResult::Ok;
-        self.response.length = length;
-        self.response.error_message = std::ptr::null_mut();
-    }
-}
-
-impl Drop for ResponseGuard {
-    fn drop(&mut self) {
-        self.notify_on_drop()
-    }
-}
-
-unsafe impl Send for ResponseGuard {}
 
 // The type used to give Julia the result of an async request. It will be allocated
 // by Julia as part of the request and filled in by Rust.
@@ -58,9 +14,33 @@ pub struct Response {
     result: CResult,
     length: usize,
     error_message: *mut c_char,
+    context: *const Context,
 }
 
 unsafe impl Send for Response {}
+
+impl RawResponse for Response {
+    type Payload = usize;
+    fn result_mut(&mut self) -> &mut CResult {
+        &mut self.result
+    }
+    fn context_mut(&mut self) -> &mut *const Context {
+        &mut self.context
+    }
+    fn error_message_mut(&mut self) -> &mut *mut c_char {
+        &mut self.error_message
+    }
+    fn set_payload(&mut self, payload: Option<Self::Payload>) {
+        match payload {
+            Some(n) => {
+                self.length = n;
+            }
+            None => {
+                self.length = 0;
+            }
+        }
+    }
+}
 
 async fn multipart_get(slice: &mut [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<usize> {
     let result = client.head(&path).await?;
@@ -153,14 +133,14 @@ pub(crate) async fn handle_put(slice: &'static [u8], path: &Path, config: &Confi
     Ok(len)
 }
 
-pub(crate) async fn handle_delete(path: &Path, config: &Config) -> anyhow::Result<()> {
+pub(crate) async fn handle_delete(path: &Path, config: &Config) -> anyhow::Result<usize> {
     let (client, _) = clients()
         .try_get_with(config.get_hash(), dyn_connect(config)).await
         .map_err(|e| anyhow!(e))?;
 
     client.delete(path).await?;
 
-    Ok(())
+    Ok(0)
 }
 
 #[no_mangle]
