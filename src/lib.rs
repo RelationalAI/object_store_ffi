@@ -339,14 +339,20 @@ macro_rules! with_retries_and_cancellation {
                             return;
                         }
                         Err(e) => {
+                            let reason = extract_error_info(&e).reason;
                             if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), $config).await {
                                 retries += 1;
-                                tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
+                                tracing::info!("retrying error (reason: {:?}) after {:?}: {}", reason, duration, e);
                                 tokio::time::sleep(duration).await;
                                 continue 'retry;
                             }
-                            tracing::warn!("{}", e);
-                            $response.into_error(e);
+                            let error_message = if retries > 0 {
+                                format!("{} (after {} extra retries, reason: {:?})", e, retries, reason)
+                            } else {
+                                format!("{}", e)
+                            };
+                            tracing::warn!("{}", error_message);
+                            $response.into_error(error_message);
                             return;
                         }
                     }
