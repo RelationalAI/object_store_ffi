@@ -1045,7 +1045,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.9.1"
-source = "git+https://github.com/andrebsguedes/arrow-rs.git?branch=backport-retries#95eacf4696feca68e1a543e04ab87a3fdbf525f7"
+source = "git+https://github.com/andrebsguedes/arrow-rs.git?tag=v0.9.0-backport1#95eacf4696feca68e1a543e04ab87a3fdbf525f7"
 dependencies = [
  "async-trait",
  "base64",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "object_store_ffi"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "async-channel",
