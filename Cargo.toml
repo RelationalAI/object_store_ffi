@@ -3,9 +3,18 @@ name = "object_store_ffi"
 version = "0.6.4"
 edition = "2021"
 
+[[bench]]
+harness = false
+name = "baseline"
+
+[[bench]]
+harness = false
+name = "overhead"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+bench = false
 
 # https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.release]
@@ -36,3 +45,6 @@ backoff = "0.4"
 hyper = { version = "0.14", default-features = false }
 flate2 = { version = "1.0.28", features=["zlib-ng"], default-features = false}
 async-compression = { version = "0.4.6", default-features = false, features = ["tokio", "gzip", "zlib", "deflate", "zstd"] }
+
+[dev-dependencies]
+criterion = { version = "0.4", default-features = false, features = ["cargo_bench_support", "html_reports"] }
