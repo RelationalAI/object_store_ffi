@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: metrics::InstrumentedAllocator = metrics::InstrumentedAllocator {};
+
 use futures_util::StreamExt;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
@@ -30,6 +33,9 @@ use crud_ops::{handle_get, handle_put, handle_delete, Response};
 
 mod stream;
 use stream::{handle_get_stream, handle_put_stream, GetStreamResponse, PutStreamResponse};
+
+mod metrics;
+pub use metrics::{InstrumentedAllocator, METRICS};
 
 // Our global variables needed by our library at runtime. Note that we follow Rust's
 // safety rules here by making them immutable with write-exactly-once semantics using
@@ -557,4 +563,9 @@ pub extern "C" fn _trigger_panic() -> CResult {
         panic!("oops");
     });
     CResult::Error
+}
+
+#[no_mangle]
+pub extern "C" fn current_metrics() -> metrics::MetricsSnapshot {
+    metrics::MetricsSnapshot::current()
 }

@@ -95,24 +95,28 @@ pub(crate) async fn handle_get(slice: &mut [u8], path: &Path, config: &Config) -
 
     // Single part Get
     let body = client.get(path).await?;
-    let mut chunks = body.into_stream().collect::<Vec<_>>().await;
-    if let Some(pos) = chunks.iter().position(|result| result.is_err()) {
-        let e = chunks.remove(pos).err().expect("already checked for error");
-        tracing::warn!("Error while fetching a chunk: {}", e);
-        return Err(e.into());
-    }
+    let mut batch_stream = body.into_stream().chunks(8);
 
     let mut received_bytes = 0;
-    for result in chunks {
-        let chunk = result.expect("checked `chunks` for errors before calling `spawn`");
-        let len = chunk.len();
+    while let Some(batch) = batch_stream.next().await {
+        for result in batch {
+            let chunk = match result {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Error while fetching a chunk: {}", e);
+                    return Err(e.into());
+                }
+            };
 
-        if received_bytes + len > slice.len() {
-            return Err(anyhow!("Supplied buffer was too small"));
+            let len = chunk.len();
+
+            if received_bytes + len > slice.len() {
+                return Err(anyhow!("Supplied buffer was too small"));
+            }
+
+            slice[received_bytes..(received_bytes + len)].copy_from_slice(&chunk);
+            received_bytes += len;
         }
-
-        slice[received_bytes..(received_bytes + len)].copy_from_slice(&chunk);
-        received_bytes += len;
     }
 
     Ok(received_bytes)
