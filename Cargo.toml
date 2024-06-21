@@ -45,6 +45,7 @@ backoff = "0.4"
 hyper = { version = "0.14", default-features = false }
 flate2 = { version = "1.0.28", features=["zlib-ng"], default-features = false}
 async-compression = { version = "0.4.6", default-features = false, features = ["tokio", "gzip", "zlib", "deflate", "zstd"] }
+flume = "0.11.0"
 
 [dev-dependencies]
 criterion = { version = "0.4", default-features = false, features = ["cargo_bench_support", "html_reports"] }

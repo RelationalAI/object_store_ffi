@@ -1,7 +1,7 @@
 #[global_allocator]
 static GLOBAL: metrics::InstrumentedAllocator = metrics::InstrumentedAllocator {};
 
-use futures_util::StreamExt;
+// use futures_util::StreamExt;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
@@ -43,7 +43,7 @@ pub use metrics::{InstrumentedAllocator, METRICS};
 static RT: OnceCell<Runtime> = OnceCell::new();
 // A channel (i.e., a queue) where the GET/PUT requests from Julia are placed and where
 // our dispatch task pulls requests.
-static SQ: OnceCell<async_channel::Sender<Request>> = OnceCell::new();
+static SQ: OnceCell<flume::Sender<Request>> = OnceCell::new();
 // The ObjectStore objects contain the context for communicating with a particular
 // storage bucket/account, including authentication info. This caches them so we do
 // not need to pay the construction cost for each request.
@@ -51,6 +51,9 @@ static CLIENTS: OnceCell<Cache<u64, (Arc<dyn ObjectStore>, ConfigMeta)>> = OnceC
 
 // Contains configuration items that are set during initialization and do not change.
 static STATIC_CONFIG: OnceCell<StaticConfig> = OnceCell::new();
+
+type ResultCallback = unsafe extern "C" fn(task: *const c_void) -> i32;
+static RESULT_CB: OnceCell<ResultCallback> = OnceCell::new();
 
 fn runtime() -> &'static Runtime {
     RT.get().expect("start was not called")
@@ -62,6 +65,10 @@ fn clients() -> &'static Cache<u64, (Arc<dyn ObjectStore>, ConfigMeta)> {
 
 fn static_config() -> &'static StaticConfig {
     STATIC_CONFIG.get().expect("start was not called")
+}
+
+fn result_cb(handle: *const c_void) -> i32 {
+    unsafe { RESULT_CB.get().expect("no result callback")(handle) }
 }
 
 // The result type used for the API functions exposed to Julia. This is used for both
@@ -336,13 +343,13 @@ macro_rules! with_retries_and_cancellation {
                 _ = $response.cancelled() => {
                     tracing::warn!("operation was cancelled");
                     $response.into_error("operation was cancelled");
-                    return;
+                    break 'retry;
                 }
                 res = $op => {
                     match res {
                         Ok(v) => {
                             $response.success(v);
-                            return;
+                            break 'retry;
                         }
                         Err(e) => {
                             let reason = extract_error_info(&e).reason;
@@ -353,13 +360,13 @@ macro_rules! with_retries_and_cancellation {
                                 continue 'retry;
                             }
                             let error_message = if retries > 0 {
-                                format!("{} (after {} extra retries, reason: {:?})", e, retries, reason)
+                                format!("{} (after {} extra retries in {:?}, reason: {:?})", e, retries, start_instant.elapsed(), reason)
                             } else {
-                                format!("{}", e)
+                                format!("{} (no extra retries in {:?})", e, start_instant.elapsed())
                             };
                             tracing::warn!("{}", error_message);
                             $response.into_error(error_message);
-                            return;
+                            break 'retry;
                         }
                     }
                 }
@@ -409,10 +416,11 @@ trait NotifyGuard {
     }
     unsafe fn notify(&self) {
         self.ensure_active();
-        uv_async_send(self.condition_handle());
+        // uv_async_send(self.condition_handle());
+        result_cb(self.condition_handle());
     }
     fn ensure_active(&self) {
-        assert!(unsafe { uv_is_active(self.condition_handle()) } != 0, "handle to the condition dropped before notification");
+        // assert!(unsafe { uv_is_active(self.condition_handle()) } != 0, "handle to the condition dropped before notification");
     }
     fn notify_on_drop(&mut self) {
         self.ensure_active();
@@ -428,12 +436,15 @@ trait NotifyGuard {
 #[no_mangle]
 pub extern "C" fn start(
     config: StaticConfig,
-    panic_cond_handle: *const c_void
+    panic_cond_handle: *const c_void,
+    result_callback: ResultCallback
 ) -> CResult {
     if let Err(_) = STATIC_CONFIG.set(config) {
         tracing::warn!("Tried to start() runtime multiple times!");
         return CResult::Error;
     }
+
+    RESULT_CB.set(result_callback).unwrap();
 
     let panic_notifier = Notifier {
         handle: panic_cond_handle
@@ -477,67 +488,77 @@ pub extern "C" fn start(
         .expect("cache was set before");
 
     // Creates our main dispatch task that takes Julia requests from the queue and does the
-    // GET or PUT. Note the 'buffer_unordered' call at the end of the map block, which lets
-    // requests in the queue be processed concurrently and in any order.
+    // operations (GET, PUT...). We run `concurrency_limit` concurrent tasks which all pop from
+    // the request queue in an async manner. Previously we used a stream and `buffer_unordered` but
+    // it was unable to keep all tasks running concurrently.
     runtime().spawn(async move {
-        let (tx, rx) = async_channel::bounded(16 * 1024);
+        let (tx, rx) = flume::bounded(16 * 1024);
         SQ.set(tx).expect("runtime already started");
 
-        rx.map(|req| {
-            async {
-                match req {
-                    Request::Get(path, slice, config, response) => {
-                        with_retries_and_cancellation!(
-                            handle_get(slice, &path, config),
-                            response,
-                            config
-                        );
-                    }
-                    Request::Put(path, slice, config, response) => {
-                        with_retries_and_cancellation!(
-                            handle_put(slice, &path, config),
-                            response,
-                            config
-                        );
-                    }
-                    Request::Delete(path, config, response) => {
-                        with_retries_and_cancellation!(
-                            handle_delete(&path, config),
-                            response,
-                            config
-                        );
-                    }
-                    Request::List(prefix, config, response) => {
-                        with_retries_and_cancellation!(
-                            handle_list(&prefix, config),
-                            response,
-                            config
-                        );
-                    }
-                    Request::ListStream(prefix, config, response) => {
-                        with_retries_and_cancellation!(
-                            handle_list_stream(&prefix, config),
-                            response,
-                            config
-                        );
-                    }
-                    Request::GetStream(path, size_hint, compression, config, response) => {
-                        with_retries_and_cancellation!(
-                            handle_get_stream(&path, size_hint, compression, config),
-                            response,
-                            config
-                        );
-                    }
-                    Request::PutStream(path, compression, config, response) => {
-                        with_retries_and_cancellation!(
-                            handle_put_stream(&path, compression, config),
-                            response,
-                            config
-                        );
+        for _i in 0..static_config().concurrency_limit {
+            let rx = rx.clone();
+            tokio::spawn(async move {
+                loop {
+                    let req = match rx.recv_async().await {
+                        Ok(r) => r,
+                        _ => {
+                            break;
+                        }
+                    };
+                    match req {
+                        Request::Get(path, slice, config, response) => {
+                            with_retries_and_cancellation!(
+                                handle_get(slice, &path, config),
+                                response,
+                                config
+                            );
+                        }
+                        Request::Put(path, slice, config, response) => {
+                            with_retries_and_cancellation!(
+                                handle_put(slice, &path, config),
+                                response,
+                                config
+                            );
+                        }
+                        Request::Delete(path, config, response) => {
+                            with_retries_and_cancellation!(
+                                handle_delete(&path, config),
+                                response,
+                                config
+                            );
+                        }
+                        Request::List(prefix, config, response) => {
+                            with_retries_and_cancellation!(
+                                handle_list(&prefix, config),
+                                response,
+                                config
+                            );
+                        }
+                        Request::ListStream(prefix, config, response) => {
+                            with_retries_and_cancellation!(
+                                handle_list_stream(&prefix, config),
+                                response,
+                                config
+                            );
+                        }
+                        Request::GetStream(path, size_hint, compression, config, response) => {
+                            with_retries_and_cancellation!(
+                                handle_get_stream(&path, size_hint, compression, config),
+                                response,
+                                config
+                            );
+                        }
+                        Request::PutStream(path, compression, config, response) => {
+                            with_retries_and_cancellation!(
+                                handle_put_stream(&path, compression, config),
+                                response,
+                                config
+                            );
+                        }
                     }
                 }
-            }
-        }).buffer_unordered(static_config().concurrency_limit as usize).for_each(|_| async {}).await;
+            });
+        }
     });
     CResult::Ok
 }

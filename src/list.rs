@@ -161,11 +161,11 @@ pub extern "C" fn list(
         Some(sq) => {
             match sq.try_send(Request::List(prefix, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(Request::List(_, _, response))) => {
+                Err(flume::TrySendError::Full(Request::List(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(Request::List(_, _, response))) => {
+                Err(flume::TrySendError::Disconnected(Request::List(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
@@ -243,11 +243,11 @@ pub extern "C" fn list_stream(
         Some(sq) => {
             match sq.try_send(Request::ListStream(prefix, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(Request::ListStream(_, _, response))) => {
+                Err(flume::TrySendError::Full(Request::ListStream(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(Request::ListStream(_, _, response))) => {
+                Err(flume::TrySendError::Disconnected(Request::ListStream(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
