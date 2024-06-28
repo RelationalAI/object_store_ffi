@@ -1,18 +1,16 @@
 use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, static_config, Request, Context, RawResponse, ResponseGuard};
-use crate::util::{size_to_ranges, Compression, with_decoder, with_encoder, cstr_to_path};
-use crate::error::{should_retry_logic, extract_error_info, backoff_duration_for_retry};
+use crate::util::{size_to_ranges, Compression, CompressedWriter, with_decoder, cstr_to_path};
+use crate::error::RetryState;
 use crate::with_cancellation;
 
 use object_store::{path::Path, ObjectStore};
 
-use std::time::Instant;
 use bytes::Buf;
 use tokio_util::io::StreamReader;
-use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncWrite, AsyncBufReadExt};
+use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncBufReadExt};
 use anyhow::anyhow;
 use std::ffi::{c_char, c_void, c_longlong};
 use futures_util::{StreamExt, TryStreamExt};
-use std::sync::Arc;
 
 pub(crate) async fn handle_get_stream(path: &Path, size_hint: usize, compression: Compression, config: &Config) -> anyhow::Result<(Box<ReadStream>, usize)> {
     let (client, config_meta) = clients()
@@ -44,28 +42,30 @@ pub(crate) async fn handle_get_stream(path: &Path, size_hint: usize, compression
             })
             .map(|((client, path, config_meta), range)| async move {
                 return tokio::spawn(async move {
-                    let start_instant = Instant::now();
-                    let mut retries = 0;
+                    let mut retry_state = RetryState::new(config_meta);
                     'retry: loop {
                         match client.get_range(&path, range.clone()).await.map_err(Into::into) {
                             Ok(bytes) => {
                                 return Ok::<_, anyhow::Error>(bytes)
                             },
                             Err(e) => {
-                                if should_retry_logic(retries, &e, start_instant.elapsed(), &config_meta) {
-                                    let duration = backoff_duration_for_retry(retries, &config_meta);
-
-                                    retries += 1;
-                                    tracing::info!("retrying error (reason: {:?}) after {:?}: {}", extract_error_info(&e).reason, duration, e);
-                                    tokio::time::sleep(duration).await;
-                                    continue 'retry;
+                                match retry_state.should_retry(&e) {
+                                    Ok((info, duration)) => {
+                                        tracing::info!("retrying get stream error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
+                                        tokio::time::sleep(duration).await;
+                                        continue 'retry;
+                                    }
+                                    Err(report) => {
+                                        tracing::warn!("[get stream] {}", report);
+                                        return Err(e);
+                                    }
                                 }
                             }
                         }
                     }
                 }).await?;
             })
-            .buffered(16)
+            .buffered(64)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
             .boxed();
 
@@ -80,11 +80,15 @@ pub(crate) async fn handle_put_stream(path: &Path, compression: Compression, con
         .try_get_with(config.get_hash(), dyn_connect(config)).await
         .map_err(|e| anyhow!(e))?;
 
-    let (id, writer) = client.put_multipart(&path).await?;
+    let writer = object_store::buffered::BufWriter::with_capacity(
+        client,
+        path.clone(),
+        10 * 1024 * 1024
+    )
+        .with_max_concurrency(64);
 
-    let encoded = with_encoder(compression, writer);
-    let upload = Some(UploadState { client, id, path: path.clone() });
-    return Ok(Box::new(WriteStream { upload, writer: encoded }));
+    let encoded = CompressedWriter::new(compression, writer);
+    return Ok(Box::new(WriteStream { writer: encoded, aborted: false }));
 }
 
 #[repr(C)]
@@ -131,9 +135,22 @@ pub struct ReadStream {
 pub extern "C" fn destroy_read_stream(
     stream: *mut ReadStream
 ) -> CResult {
-    let boxed = unsafe { Box::from_raw(stream) };
-    drop(boxed);
-    CResult::Ok
+    // Destroying complex objects is safer to do within the runtime to guard
+    // against the case were the destructor needs to spawn a task
+    match RT.get() {
+        Some(runtime) => {
+            let handle = runtime.handle();
+            handle.block_on(async {
+                let boxed = unsafe { Box::from_raw(stream) };
+                drop(boxed);
+            });
+            CResult::Ok
+        }
+        None => {
+            tracing::error!("failed to destroy read stream, runtime not started");
+            CResult::Error
+        }
+    }
 }
 
 #[repr(C)]
@@ -358,32 +375,32 @@ impl RawResponse for WriteResponse {
     }
 }
 
-struct UploadState {
-    client: Arc<dyn ObjectStore>,
-    id: object_store::MultipartId,
-    path: Path
-}
-
-impl UploadState {
-    async fn cleanup(&self) {
-        if let Err(e) = self.client.abort_multipart(&self.path, &self.id).await {
-            tracing::error!("failed to abort multipart upload: {}", e);
-        }
-    }
-}
 
 pub struct WriteStream {
-    upload: Option<UploadState>,
-    writer: Box<dyn AsyncWrite + Unpin + Send>
+    writer: CompressedWriter<object_store::buffered::BufWriter>,
+    aborted: bool
 }
 
 #[no_mangle]
 pub extern "C" fn destroy_write_stream(
     writer: *mut WriteStream
 ) -> CResult {
-    let boxed = unsafe { Box::from_raw(writer) };
-    drop(boxed);
-    CResult::Ok
+    // Destroying complex objects is safer to do within the runtime to guard
+    // against the case were the destructor needs to spawn a task
+    match RT.get() {
+        Some(runtime) => {
+            let handle = runtime.handle();
+            handle.block_on(async {
+                let boxed = unsafe { Box::from_raw(writer) };
+                drop(boxed);
+            });
+            CResult::Ok
+        }
+        None => {
+            tracing::error!("failed to destroy write stream, runtime not started");
+            CResult::Error
+        }
+    }
 }
 
 #[repr(C)]
@@ -504,18 +521,30 @@ pub extern "C" fn write_to_stream(
     match RT.get() {
         Some(runtime) => {
             runtime.spawn(async move {
-                let write_op = async {
-                    let mut bytes_written = 0;
-                    while slice.has_remaining() {
-                        bytes_written += wrapper.writer.write_buf(&mut slice).await?;
+                let abort_on_error = async {
+                    let write_op = async {
+                        let mut bytes_written = 0;
+                        while slice.has_remaining() {
+                            bytes_written += wrapper.writer.write_buf(&mut slice).await?;
+                        }
+                        if flush {
+                            wrapper.writer.flush().await?;
+                        }
+                        Ok::<_, anyhow::Error>(bytes_written)
+                    };
+                    match write_op.await {
+                        Ok(r) => Ok(r),
+                        Err(e) => {
+                            if !wrapper.aborted {
+                                let _ = wrapper.writer.abort().await;
+                                wrapper.aborted = true;
+                            }
+                            Err(e)
+                        }
                     }
-                    if flush {
-                        wrapper.writer.flush().await?;
-                    }
-                    Ok::<_, anyhow::Error>(bytes_written)
                 };
 
-                with_cancellation!(write_op, response);
+                with_cancellation!(abort_on_error, response);
             });
             CResult::Ok
         }
@@ -558,10 +587,8 @@ pub extern "C" fn shutdown_write_stream(
                 // Manual cancellation due to cleanup
                 tokio::select! {
                     _ = response.cancelled() => {
+                        // TODO maybe abort on cancellation
                         tracing::warn!("operation was cancelled");
-                        if let Some(upload) = wrapper.upload.as_ref() {
-                            upload.cleanup().await;
-                        }
                         response.into_error("operation was cancelled");
                         return;
                     }
@@ -571,9 +598,8 @@ pub extern "C" fn shutdown_write_stream(
                         },
                         Err(e) => {
                             tracing::warn!("{}", e);
-                            if let Some(upload) = wrapper.upload.as_ref() {
-                                upload.cleanup().await;
-                            }
+                            // TODO abort upload, BufWriter currently panics if we abort here
+                            wrapper.aborted = true;
                             response.into_error(e);
                         }
                     }

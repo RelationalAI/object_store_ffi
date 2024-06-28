@@ -3,6 +3,7 @@ use crate::static_config;
 use std::ops::Range;
 use std::ffi::c_char;
 use anyhow::anyhow;
+use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncBufRead, AsyncWrite};
 
 pub(crate) fn size_to_ranges(object_size: usize) -> Vec<Range<usize>> {
@@ -59,6 +60,101 @@ impl TryFrom<*const c_char> for Compression {
     }
 }
 
+#[derive(Debug)]
+#[pin_project(project = EncoderProj)]
+pub(crate) enum Encoder<T: AsyncWrite> {
+    None(#[pin] T),
+    Gzip(#[pin] async_compression::tokio::write::GzipEncoder<T>),
+    Deflate(#[pin] async_compression::tokio::write::DeflateEncoder<T>),
+    Zlib(#[pin] async_compression::tokio::write::ZlibEncoder<T>),
+    Zstd(#[pin] async_compression::tokio::write::ZstdEncoder<T>)
+}
+
+#[pin_project]
+pub(crate) struct CompressedWriter<T: AsyncWrite> {
+    #[pin]
+    encoder: Encoder<T>
+}
+
+impl<T: AsyncWrite> CompressedWriter<T> {
+    pub fn new(compression: Compression, writer: T) -> CompressedWriter<T> {
+        let encoder = match compression {
+            Compression::Gzip => {
+                Encoder::Gzip(async_compression::tokio::write::GzipEncoder::new(writer))
+            }
+            Compression::Deflate => {
+                Encoder::Deflate(async_compression::tokio::write::DeflateEncoder::new(writer))
+            }
+            Compression::Zlib => {
+                Encoder::Zlib(async_compression::tokio::write::ZlibEncoder::new(writer))
+            }
+            Compression::Zstd => {
+                Encoder::Zstd(async_compression::tokio::write::ZstdEncoder::new(writer))
+            }
+            Compression::None => {
+                Encoder::None(writer)
+            }
+        };
+        CompressedWriter {
+            encoder
+        }
+    }
+}
+
+impl CompressedWriter<object_store::buffered::BufWriter> {
+    pub(crate) async fn abort(&mut self) -> anyhow::Result<()> {
+        let writer = match &mut self.encoder {
+            Encoder::None(e) => e,
+            Encoder::Gzip(e) => e.get_mut(),
+            Encoder::Deflate(e) => e.get_mut(),
+            Encoder::Zlib(e) => e.get_mut(),
+            Encoder::Zstd(e) => e.get_mut(),
+        };
+
+        Ok(writer.abort().await?)
+    }
+}
+
+impl<T: AsyncWrite> AsyncWrite for CompressedWriter<T> {
+    fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        match self.project().encoder.project() {
+            EncoderProj::None(e) => e.poll_write(cx, buf),
+            EncoderProj::Gzip(e) => e.poll_write(cx, buf),
+            EncoderProj::Deflate(e) => e.poll_write(cx, buf),
+            EncoderProj::Zlib(e) => e.poll_write(cx, buf),
+            EncoderProj::Zstd(e) => e.poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match self.project().encoder.project() {
+            EncoderProj::None(e) => e.poll_flush(cx),
+            EncoderProj::Gzip(e) => e.poll_flush(cx),
+            EncoderProj::Deflate(e) => e.poll_flush(cx),
+            EncoderProj::Zlib(e) => e.poll_flush(cx),
+            EncoderProj::Zstd(e) => e.poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match self.project().encoder.project() {
+            EncoderProj::None(e) => e.poll_shutdown(cx),
+            EncoderProj::Gzip(e) => e.poll_shutdown(cx),
+            EncoderProj::Deflate(e) => e.poll_shutdown(cx),
+            EncoderProj::Zlib(e) => e.poll_shutdown(cx),
+            EncoderProj::Zstd(e) => e.poll_shutdown(cx),
+        }
+    }
+}
+
 pub(crate) fn with_decoder(compression: Compression, reader: impl AsyncBufRead + Unpin + Send + 'static) -> Box<dyn AsyncRead + Unpin + Send> {
     match compression {
         Compression::Gzip => {
@@ -79,7 +175,7 @@ pub(crate) fn with_decoder(compression: Compression, reader: impl AsyncBufRead +
     }
 }
 
-pub(crate) fn with_encoder(compression: Compression, writer: impl AsyncWrite + Unpin + Send + 'static) -> Box<dyn AsyncWrite + Unpin + Send> {
+pub(crate) fn _with_encoder(compression: Compression, writer: impl AsyncWrite + Unpin + Send + 'static) -> Box<dyn AsyncWrite + Unpin + Send> {
     match compression {
         Compression::Gzip => {
             return Box::new(async_compression::tokio::write::GzipEncoder::new(writer));

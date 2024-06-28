@@ -9,7 +9,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use anyhow::anyhow;
 
 use std::collections::hash_map::DefaultHasher;
@@ -23,7 +23,7 @@ mod util;
 use util::Compression;
 
 mod error;
-use error::{extract_error_info, should_retry};
+use error::RetryState;
 
 mod list;
 use list::{handle_list, handle_list_stream, ListResponse, ListStreamResponse};
@@ -54,6 +54,8 @@ static STATIC_CONFIG: OnceCell<StaticConfig> = OnceCell::new();
 
 type ResultCallback = unsafe extern "C" fn(task: *const c_void) -> i32;
 static RESULT_CB: OnceCell<ResultCallback> = OnceCell::new();
+
+type PanicCallback = unsafe extern "C" fn() -> i32;
 
 fn runtime() -> &'static Runtime {
     RT.get().expect("start was not called")
@@ -170,25 +172,10 @@ unsafe impl Send for Request {}
 // Note that this will be linked in from the Julia process, we do not try
 // to link it while building this Rust lib.
 extern "C" {
-    fn uv_async_send(cond: *const c_void) -> i32;
-    fn uv_is_active(cond: *const c_void) -> i32;
+    fn jl_adopt_thread() -> i32;
+    fn jl_gc_safe_enter() -> i32;
+    fn jl_enter_threaded_region() -> i32;
 }
-
-#[derive(Debug)]
-#[repr(C)]
-pub struct Notifier {
-    handle: *const c_void,
-}
-
-impl Notifier {
-    fn notify(&self) -> i32 {
-        assert!(unsafe { uv_is_active(self.handle) } != 0);
-        unsafe { uv_async_send(self.handle) }
-    }
-}
-
-unsafe impl Send for Notifier {}
-unsafe impl Sync for Notifier {}
 
 // This is used to configure all aspects of the underlying
 // object store client including credentials, request and client options.
@@ -218,6 +205,16 @@ impl Config {
     fn as_json(&self) -> anyhow::Result<serde_json::Value> {
         Ok(serde_json::from_str(self.as_str())?)
     }
+
+    fn as_map(&self) -> anyhow::Result<HashMap<String, String>> {
+        let value = self.as_json()
+            .map_err(|e| anyhow!("failed to parse json serialized config: {}", e))?;
+
+        let map: HashMap<String, String> = serde_json::from_value(value)
+            .map_err(|e| anyhow!("config must be a json serialized object: {}", e))?;
+
+        Ok(map)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -225,36 +222,19 @@ struct ConfigMeta {
     retry_config: RetryConfig
 }
 
-async fn dyn_connect(config: &Config) -> anyhow::Result<(Arc<dyn ObjectStore>, ConfigMeta)> {
-    let value = config.as_json()
-            .map_err(|e| anyhow!("failed to parse json serialized config: {}", e))?;
+async fn get_config_meta_or_parse(config: &Config) -> anyhow::Result<ConfigMeta> {
+    let meta = match clients().get(&config.get_hash()).await {
+        Some((_, meta)) => meta,
+        None => {
+            let mut map = config.as_map()?;
+            ConfigMeta { retry_config: parse_retry_config(&mut map)? }
+        }
+    };
 
-    let mut map: HashMap<String, String> = serde_json::from_value(value)
-        .map_err(|e| anyhow!("config must be a json serialized object: {}", e))?;
+    Ok(meta)
+}
 
-    let url = map.remove("url")
-        .ok_or(anyhow!("config object must have a key named 'url'"))?;
-
-    let url = url::Url::parse(&url)
-        .map_err(|e| anyhow!("failed to parse `url`: {}", e))?;
-
-    if let Some(v) = map.remove("azurite_host") {
-        let mut azurite_host = url::Url::parse(&v)
-            .map_err(|e| anyhow!("failed to parse azurite_host: {}", e))?;
-        azurite_host.set_path("");
-        std::env::set_var("AZURITE_BLOB_STORAGE_URL", azurite_host.as_str());
-        map.insert("allow_invalid_certificates".into(), "true".into());
-        map.insert("azure_storage_use_emulator".into(), "true".into());
-    }
-
-    if let Some(v) = map.remove("minio_host") {
-        let mut minio_host = url::Url::parse(&v)
-            .map_err(|e| anyhow!("failed to parse minio_host: {}", e))?;
-        minio_host.set_path("");
-        map.insert("allow_http".into(), "true".into());
-        map.insert("aws_endpoint".into(), minio_host.as_str().trim_end_matches('/').to_string());
-    }
-
+fn parse_retry_config(map: &mut HashMap<String, String>) -> anyhow::Result<RetryConfig> {
     let mut retry_config = RetryConfig::default();
     if let Some(value) = map.remove("max_retries") {
         retry_config.max_retries = value.parse()
@@ -279,6 +259,37 @@ async fn dyn_connect(config: &Config) -> anyhow::Result<(Arc<dyn ObjectStore>, C
         retry_config.backoff.base = value.parse()
             .map_err(|e| anyhow!("failed to parse backoff_exp_base: {}", e))?;
     }
+
+    Ok(retry_config)
+}
+
+async fn dyn_connect(config: &Config) -> anyhow::Result<(Arc<dyn ObjectStore>, ConfigMeta)> {
+    let mut map = config.as_map()?;
+
+    let url = map.remove("url")
+        .ok_or(anyhow!("config object must have a key named 'url'"))?;
+
+    let url = url::Url::parse(&url)
+        .map_err(|e| anyhow!("failed to parse `url`: {}", e))?;
+
+    if let Some(v) = map.remove("azurite_host") {
+        let mut azurite_host = url::Url::parse(&v)
+            .map_err(|e| anyhow!("failed to parse azurite_host: {}", e))?;
+        azurite_host.set_path("");
+        std::env::set_var("AZURITE_BLOB_STORAGE_URL", azurite_host.as_str());
+        map.insert("allow_invalid_certificates".into(), "true".into());
+        map.insert("azure_storage_use_emulator".into(), "true".into());
+    }
+
+    if let Some(v) = map.remove("minio_host") {
+        let mut minio_host = url::Url::parse(&v)
+            .map_err(|e| anyhow!("failed to parse minio_host: {}", e))?;
+        minio_host.set_path("");
+        map.insert("allow_http".into(), "true".into());
+        map.insert("aws_endpoint".into(), minio_host.as_str().trim_end_matches('/').to_string());
+    }
+
+    let retry_config = parse_retry_config(&mut map)?;
 
     let client: Arc<dyn ObjectStore> = match url.scheme() {
         "s3" => {
@@ -335,8 +346,17 @@ impl Default for StaticConfig {
 
 macro_rules! with_retries_and_cancellation {
     ($op:expr, $response:expr, $config: expr) => {
-        let start_instant = Instant::now();
-        let mut retries = 0;
+        with_retries_and_cancellation!($op, $response, $config, true)
+    };
+    ($op:expr, $response:expr, $config: expr, $emit_warn: expr) => {
+        let meta = match get_config_meta_or_parse($config).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                $response.into_error(e);
+                return;
+            }
+        };
+        let mut retry_state = RetryState::new(meta);
         'retry: loop {
             $response.ensure_active();
             tokio::select! {
@@ -352,21 +372,20 @@ macro_rules! with_retries_and_cancellation {
                             break 'retry;
                         }
                         Err(e) => {
-                            let reason = extract_error_info(&e).reason;
-                            if let Some(duration) = should_retry(retries, &e, start_instant.elapsed(), $config).await {
-                                retries += 1;
-                                tracing::info!("retrying error (reason: {:?}) after {:?}: {}", reason, duration, e);
-                                tokio::time::sleep(duration).await;
-                                continue 'retry;
+                            match retry_state.should_retry(&e) {
+                                Ok((info, duration)) => {
+                                    tracing::info!("retrying error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
+                                    tokio::time::sleep(duration).await;
+                                    continue 'retry;
+                                }
+                                Err(e) => {
+                                    if $emit_warn {
+                                        tracing::warn!("{}", e);
+                                    }
+                                    $response.into_error(e);
+                                    break 'retry;
+                                }
                             }
-                            let error_message = if retries > 0 {
-                                format!("{} (after {} extra retries in {:?}, reason: {:?})", e, retries, start_instant.elapsed(), reason)
-                            } else {
-                                format!("{} (no extra retries in {:?})", e, start_instant.elapsed())
-                            };
-                            tracing::warn!("{}", error_message);
-                            $response.into_error(error_message);
-                            break 'retry;
                         }
                     }
                 }
@@ -436,7 +455,7 @@ trait NotifyGuard {
 #[no_mangle]
 pub extern "C" fn start(
     config: StaticConfig,
-    panic_cond_handle: *const c_void,
+    panic_callback: PanicCallback,
     result_callback: ResultCallback
 ) -> CResult {
     if let Err(_) = STATIC_CONFIG.set(config) {
@@ -446,14 +465,10 @@ pub extern "C" fn start(
 
     RESULT_CB.set(result_callback).unwrap();
 
-    let panic_notifier = Notifier {
-        handle: panic_cond_handle
-    };
-
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         prev(info);
-        panic_notifier.notify();
+        unsafe { panic_callback() };
     }));
 
     if std::env::var("RUST_LOG").is_err() {
@@ -464,6 +479,11 @@ pub extern "C" fn start(
 
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
+    rt_builder.on_thread_start(|| {
+        unsafe { jl_adopt_thread() };
+        unsafe { jl_gc_safe_enter() };
+        unsafe { jl_enter_threaded_region() };
+    });
 
     let n_threads = static_config().n_threads;
     if n_threads > 0 {
@@ -492,7 +512,7 @@ pub extern "C" fn start(
     // the request queue in an async manner. Previously we used a stream and `buffer_unordered` but
     // it was unable to keep all tasks running concurrently.
     runtime().spawn(async move {
-        let (tx, rx) = flume::bounded(16 * 1024);
+        let (tx, rx) = flume::bounded(32 * 1024);
         SQ.set(tx).expect("runtime already started");
 
         for _i in 0..static_config().concurrency_limit {
@@ -524,7 +544,8 @@ pub extern "C" fn start(
                             with_retries_and_cancellation!(
                                 handle_delete(&path, config),
                                 response,
-                                config
+                                config,
+                                false
                             );
                         }
                         Request::List(prefix, config, response) => {

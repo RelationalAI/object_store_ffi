@@ -188,11 +188,24 @@ pub struct StreamWrapper {
 pub extern "C" fn destroy_list_stream(
     stream: *mut StreamWrapper
 ) -> CResult {
-    let mut boxed = unsafe { Box::from_raw(stream) };
-    // Safety: Must drop the stream before the client here
-    drop(boxed.stream.take());
-    drop(boxed);
-    CResult::Ok
+    // Destroying complex objects is safer to do within the runtime to guard
+    // against the case were the destructor needs to spawn a task
+    match RT.get() {
+        Some(runtime) => {
+            let handle = runtime.handle();
+            handle.block_on(async {
+                let mut boxed = unsafe { Box::from_raw(stream) };
+                // Safety: Must drop the stream before the client here
+                drop(boxed.stream.take());
+                drop(boxed);
+            });
+            CResult::Ok
+        }
+        None => {
+            tracing::error!("failed to destroy list stream, runtime not started");
+            CResult::Error
+        }
+    }
 }
 
 #[repr(C)]
