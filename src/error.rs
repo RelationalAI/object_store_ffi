@@ -1,8 +1,9 @@
 use std::time::Duration;
 use backoff::backoff::Backoff;
 use once_cell::sync::Lazy;
-use crate::{Config, ConfigMeta, clients};
+use crate::ConfigMeta;
 use std::error::Error as StdError;
+use anyhow::anyhow;
 
 // These regexes are used to extract error info from some object_store private errors.
 // We construct the regexes lazily and reuse them due to the runtime compilation cost.
@@ -10,13 +11,13 @@ static CLIENT_ERR_REGEX: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"C
 static REQWEST_ERR_REGEX: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"Reqwest \{ retries: (?<retries>\d+?), max_retries: (?<max_retries>\d+?),").unwrap());
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ErrorInfo {
     pub(crate) retries: Option<usize>,
     pub(crate) reason: ErrorReason
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ErrorReason {
     Unknown,
     Code(u16),
@@ -24,20 +25,14 @@ pub(crate) enum ErrorReason {
     Timeout
 }
 
-pub(crate) fn backoff_duration_for_retry(retries: usize, meta: &ConfigMeta) -> Duration {
-    // We try to use the same settings as the object_store backoff but the implementation is
-    // different so this is best effort.
-    let mut backoff = backoff::ExponentialBackoff {
-        initial_interval: meta.retry_config.backoff.init_backoff,
-        max_interval: meta.retry_config.backoff.max_backoff,
-        ..Default::default()
-    };
-
-    for _retry in 0..retries {
-        let _ = backoff.next_backoff();
-    }
-
-    backoff.next_backoff().unwrap_or(meta.retry_config.backoff.max_backoff)
+pub(crate) fn format_err(error: &anyhow::Error) -> String {
+    use std::fmt::Write;
+    let mut error_string = format!("{}\n\nCaused by:\n", error);
+    error.chain()
+        .skip(1)
+        .enumerate()
+        .for_each(|(idx, cause)| write!(error_string, "    {}: {}\n", idx, cause).unwrap());
+    error_string
 }
 
 pub(crate) fn extract_error_info(error: &anyhow::Error) -> ErrorInfo {
@@ -123,46 +118,113 @@ pub(crate) fn extract_error_info(error: &anyhow::Error) -> ErrorInfo {
     ErrorInfo { retries, reason: ErrorReason::Unknown }
 }
 
-pub(crate) async fn should_retry(retries: usize, error: &anyhow::Error, elapsed: Duration, config: &Config) -> Option<Duration> {
-    let Some((_, meta)) = clients().get(&config.get_hash()).await else { return None };
-    if should_retry_logic(retries, error, elapsed, &meta) {
-        Some(backoff_duration_for_retry(retries, &meta))
-    } else {
-        None
-    }
+#[derive(Debug)]
+pub(crate) struct RetryState {
+    pub(crate) start: std::time::Instant,
+    pub(crate) attempts: Vec<ErrorInfo>,
+    pub(crate) config_meta: ConfigMeta
 }
 
-pub(crate) fn should_retry_logic(retries: usize, error: &anyhow::Error, elapsed: Duration, meta: &ConfigMeta) -> bool {
-    let info = extract_error_info(error);
-    let max_retries = meta.retry_config.max_retries;
-    // Don't retry errors that were fully retried already
-    let store_retries = match info.retries {
-        Some(store_retries) => {
-            if store_retries + retries >= max_retries {
-                return false
+impl RetryState {
+    pub(crate) fn new(config_meta: ConfigMeta) -> RetryState {
+        RetryState {
+            start: std::time::Instant::now(),
+            attempts: vec![],
+            config_meta
+        }
+    }
+
+    pub(crate) fn retries(&self) -> usize {
+        let prev_retries = self.attempts.iter()
+            .map(|a| a.retries.unwrap_or_default())
+            .sum::<usize>();
+        prev_retries + self.attempts.len().saturating_sub(1)
+    }
+
+    fn next_backoff(&self) -> Duration {
+        // We try to use the same settings as the object_store backoff but the implementation is
+        // different so this is best effort.
+        let mut backoff = backoff::ExponentialBackoff {
+            initial_interval: self.config_meta.retry_config.backoff.init_backoff,
+            max_interval: self.config_meta.retry_config.backoff.max_backoff,
+            ..Default::default()
+        };
+
+
+        for _retry in 0..self.retries() {
+            let _ = backoff.next_backoff();
+        }
+
+        backoff.next_backoff().unwrap_or(self.config_meta.retry_config.backoff.max_backoff)
+    }
+
+    fn log_attempt(&mut self, info: ErrorInfo) {
+        self.attempts.push(info);
+    }
+
+    pub(crate) fn should_retry_logic(&self) -> bool {
+        let max_retries = self.config_meta.retry_config.max_retries;
+        let retry_timeout = self.config_meta.retry_config.retry_timeout;
+        let elapsed = self.start.elapsed();
+        let all_retries = self.retries();
+
+        let Some(last_attempt) = self.attempts.iter().last() else { return true };
+
+        match last_attempt.reason {
+            ErrorReason::Timeout => {
+                // Retry timeouts up to retry_timeout or max_retries
+                all_retries < max_retries && elapsed < retry_timeout
             }
-            store_retries
-        },
-        None => 0
-    };
+            ErrorReason::Code(_code) => {
+                // TODO manage custom status_code retries
+                false
+            }
+            ErrorReason::Io => {
+                // Retry io errors up to retry_timeout or max_retries
+                all_retries < max_retries && elapsed < retry_timeout
+            }
+            ErrorReason::Unknown => {
+                false
+            }
+        }
+    }
 
-    let all_retries = retries + store_retries;
+    pub(crate) fn retry_report(&self) -> String {
+        use std::fmt::Write;
+        let mut report = String::new();
+        if !self.attempts.is_empty() {
+            let attempts_to_display = self.attempts.len().min(10);
+            write!(report, "Recent attempts ({} out of {}):\n", attempts_to_display, self.attempts.len()).unwrap();
+            self.attempts
+                .iter()
+                .rev()
+                .take(10)
+                .rev()
+                .for_each(|info| {
+                    write!(
+                        report,
+                        "    reason: {:?} after {} retries\n",
+                        info.reason,
+                        info.retries.unwrap_or_default()
+                    ).unwrap()
+                });
+        } else {
+            write!(report, "There were no attempts\n").unwrap();
+        }
+        write!(report, "Total retries: {}\n", self.retries()).unwrap();
+        write!(report, "Total Time: {:?}\n", self.start.elapsed()).unwrap();
+        report
+    }
 
-    match info.reason {
-        ErrorReason::Timeout => {
-            // Retry timeouts up to retry_timeout or max_retries
-            all_retries < max_retries && elapsed < meta.retry_config.retry_timeout
-        }
-        ErrorReason::Code(_code) => {
-            // TODO manage custom status_code retries
-            false
-        }
-        ErrorReason::Io => {
-            // Retry io errors up to retry_timeout or max_retries
-            all_retries < max_retries && elapsed < meta.retry_config.retry_timeout
-        }
-        ErrorReason::Unknown => {
-            false
-        }
+    pub(crate) fn should_retry(&mut self, error: &anyhow::Error) -> anyhow::Result<(ErrorInfo, Duration)> {
+        let info = extract_error_info(error);
+        self.log_attempt(info.clone());
+        let decision = if self.should_retry_logic() {
+            Ok((info, self.next_backoff()))
+        } else {
+            let error_report = format_err(error);
+            Err(anyhow!("{}\n{}", error_report, self.retry_report()))
+        };
+        decision
     }
 }

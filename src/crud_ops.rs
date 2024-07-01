@@ -6,6 +6,7 @@ use anyhow::anyhow;
 use std::ffi::{c_char, c_void};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
+use std::sync::Arc;
 
 // The type used to give Julia the result of an async request. It will be allocated
 // by Julia as part of the request and filled in by Rust.
@@ -60,8 +61,13 @@ async fn multipart_get(slice: &mut [u8], path: &Path, client: &dyn ObjectStore) 
     return Ok(accum);
 }
 
-async fn multipart_put(slice: &[u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<()> {
-    let (multipart_id, mut writer) = client.put_multipart(&path).await?;
+async fn multipart_put(slice: &[u8], path: &Path, client: Arc<dyn ObjectStore>) -> anyhow::Result<()> {
+    let mut writer = object_store::buffered::BufWriter::with_capacity(
+        client,
+        path.clone(),
+        10 * 1024 * 1024
+    )
+        .with_max_concurrency(64);
     match writer.write_all(slice).await {
         Ok(_) => {
             match writer.flush().await {
@@ -70,13 +76,13 @@ async fn multipart_put(slice: &[u8], path: &Path, client: &dyn ObjectStore) -> a
                     return Ok(());
                 }
                 Err(e) => {
-                    client.abort_multipart(&path, &multipart_id).await?;
+                    writer.abort().await?;
                     return Err(e.into());
                 }
             }
         }
         Err(e) => {
-            client.abort_multipart(&path, &multipart_id).await?;
+            writer.abort().await?;
             return Err(e.into());
         }
     };
@@ -103,8 +109,9 @@ pub(crate) async fn handle_get(slice: &mut [u8], path: &Path, config: &Config) -
             let chunk = match result {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!("Error while fetching a chunk: {}", e);
-                    return Err(e.into());
+                    let err = anyhow::Error::new(e);
+                    tracing::warn!("Error while fetching a chunk: {:#}", err);
+                    return Err(err);
                 }
             };
 
@@ -131,7 +138,7 @@ pub(crate) async fn handle_put(slice: &'static [u8], path: &Path, config: &Confi
     if len < static_config().multipart_put_threshold as usize {
         let _ = client.put(path, slice.into()).await?;
     } else {
-        let _ = multipart_put(slice, path, &client).await?;
+        let _ = multipart_put(slice, path, client).await?;
     }
 
     Ok(len)
@@ -165,11 +172,11 @@ pub extern "C" fn get(
         Some(sq) => {
             match sq.try_send(Request::Get(path, slice, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(Request::Get(_, _, _, response))) => {
+                Err(flume::TrySendError::Full(Request::Get(_, _, _, response))) => {
                     response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(Request::Get(_, _, _, response))) => {
+                Err(flume::TrySendError::Disconnected(Request::Get(_, _, _, response))) => {
                     response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
@@ -201,11 +208,11 @@ pub extern "C" fn put(
         Some(sq) => {
             match sq.try_send(Request::Put(path, slice, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(Request::Put(_, _, _, response))) => {
+                Err(flume::TrySendError::Full(Request::Put(_, _, _, response))) => {
                     response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(Request::Put(_, _, _, response))) => {
+                Err(flume::TrySendError::Disconnected(Request::Put(_, _, _, response))) => {
                     response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
@@ -234,11 +241,11 @@ pub extern "C" fn delete(
         Some(sq) => {
             match sq.try_send(Request::Delete(path, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(Request::Delete(_, _, response))) => {
+                Err(flume::TrySendError::Full(Request::Delete(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(Request::Delete(_, _, response))) => {
+                Err(flume::TrySendError::Disconnected(Request::Delete(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }

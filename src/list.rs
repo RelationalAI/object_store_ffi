@@ -161,11 +161,11 @@ pub extern "C" fn list(
         Some(sq) => {
             match sq.try_send(Request::List(prefix, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(Request::List(_, _, response))) => {
+                Err(flume::TrySendError::Full(Request::List(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(Request::List(_, _, response))) => {
+                Err(flume::TrySendError::Disconnected(Request::List(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
@@ -188,11 +188,24 @@ pub struct StreamWrapper {
 pub extern "C" fn destroy_list_stream(
     stream: *mut StreamWrapper
 ) -> CResult {
-    let mut boxed = unsafe { Box::from_raw(stream) };
-    // Safety: Must drop the stream before the client here
-    drop(boxed.stream.take());
-    drop(boxed);
-    CResult::Ok
+    // Destroying complex objects is safer to do within the runtime to guard
+    // against the case were the destructor needs to spawn a task
+    match RT.get() {
+        Some(runtime) => {
+            let handle = runtime.handle();
+            handle.block_on(async {
+                let mut boxed = unsafe { Box::from_raw(stream) };
+                // Safety: Must drop the stream before the client here
+                drop(boxed.stream.take());
+                drop(boxed);
+            });
+            CResult::Ok
+        }
+        None => {
+            tracing::error!("failed to destroy list stream, runtime not started");
+            CResult::Error
+        }
+    }
 }
 
 #[repr(C)]
@@ -243,11 +256,11 @@ pub extern "C" fn list_stream(
         Some(sq) => {
             match sq.try_send(Request::ListStream(prefix, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(async_channel::TrySendError::Full(Request::ListStream(_, _, response))) => {
+                Err(flume::TrySendError::Full(Request::ListStream(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(async_channel::TrySendError::Closed(Request::ListStream(_, _, response))) => {
+                Err(flume::TrySendError::Disconnected(Request::ListStream(_, _, response))) => {
                     response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
