@@ -167,14 +167,13 @@ enum Request {
 
 unsafe impl Send for Request {}
 
-
-// libuv is how we notify Julia tasks that their async requests are done.
+// We use `jl_adopt_thread` to ensure Rust can call into Julia when notifying
+// the Base.Event that is waiting for the Rust result.
 // Note that this will be linked in from the Julia process, we do not try
 // to link it while building this Rust lib.
 extern "C" {
     fn jl_adopt_thread() -> i32;
     fn jl_gc_safe_enter() -> i32;
-    fn jl_enter_threaded_region() -> i32;
 }
 
 // This is used to configure all aspects of the underlying
@@ -435,11 +434,10 @@ trait NotifyGuard {
     }
     unsafe fn notify(&self) {
         self.ensure_active();
-        // uv_async_send(self.condition_handle());
         result_cb(self.condition_handle());
     }
     fn ensure_active(&self) {
-        // assert!(unsafe { uv_is_active(self.condition_handle()) } != 0, "handle to the condition dropped before notification");
+        // There is no known way to check if a task is still alive before notifying
     }
     fn notify_on_drop(&mut self) {
         self.ensure_active();
@@ -482,7 +480,6 @@ pub extern "C" fn start(
     rt_builder.on_thread_start(|| {
         unsafe { jl_adopt_thread() };
         unsafe { jl_gc_safe_enter() };
-        unsafe { jl_enter_threaded_region() };
     });
 
     let n_threads = static_config().n_threads;
