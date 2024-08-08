@@ -20,6 +20,10 @@ bench = false
 [profile.release]
 debug = 1
 
+[features]
+default = ["julia"]
+julia = []
+
 [dependencies]
 tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }

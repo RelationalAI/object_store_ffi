@@ -1,4 +1,4 @@
-use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, static_config, Request, Context, RawResponse, ResponseGuard};
+use crate::{static_config, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
 use crate::util::{size_to_ranges, Compression, CompressedWriter, with_decoder, cstr_to_path};
 use crate::error::RetryState;
 use crate::with_cancellation;
@@ -8,18 +8,13 @@ use object_store::{path::Path, ObjectStore};
 use bytes::Buf;
 use tokio_util::io::StreamReader;
 use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncBufReadExt};
-use anyhow::anyhow;
 use std::ffi::{c_char, c_void, c_longlong};
 use futures_util::{StreamExt, TryStreamExt};
 
-pub(crate) async fn handle_get_stream(path: &Path, size_hint: usize, compression: Compression, config: &Config) -> anyhow::Result<(Box<ReadStream>, usize)> {
-    let (client, config_meta) = clients()
-        .try_get_with(config.get_hash(), dyn_connect(config)).await
-        .map_err(|e| anyhow!(e))?;
-
+pub(crate) async fn handle_get_stream(client: Client, path: &Path, size_hint: usize, compression: Compression) -> anyhow::Result<(Box<ReadStream>, usize)> {
     if size_hint > 0 && size_hint < static_config().multipart_get_threshold as usize {
         // Perform a single get without the head request
-        let result = client.get(path).await?;
+        let result = client.store.get(path).await?;
         let full_size = result.meta.size;
         let stream = result.into_stream().map_err(Into::<std::io::Error>::into).boxed();
         let reader = StreamReader::new(stream);
@@ -27,24 +22,23 @@ pub(crate) async fn handle_get_stream(path: &Path, size_hint: usize, compression
         return Ok((Box::new(ReadStream { reader: tokio::io::BufReader::with_capacity(64 * 1024, decoded) }), full_size));
     } else {
         // Perform head request and prefetch parts in parallel
-        let meta = client.head(&path).await?;
+        let meta = client.store.head(&path).await?;
         let part_ranges = size_to_ranges(meta.size);
 
         let state = (
             client,
-            path.clone(),
-            config_meta.clone()
+            path.clone()
         );
         let stream = futures_util::stream::iter(part_ranges)
             .scan(state, |state, range| {
                 let state = state.clone();
                 async move { Some((state, range)) }
             })
-            .map(|((client, path, config_meta), range)| async move {
+            .map(|((client, path), range)| async move {
                 return tokio::spawn(async move {
-                    let mut retry_state = RetryState::new(config_meta);
+                    let mut retry_state = RetryState::new(client.config.retry_config);
                     'retry: loop {
-                        match client.get_range(&path, range.clone()).await.map_err(Into::into) {
+                        match client.store.get_range(&path, range.clone()).await.map_err(Into::into) {
                             Ok(bytes) => {
                                 return Ok::<_, anyhow::Error>(bytes)
                             },
@@ -75,13 +69,9 @@ pub(crate) async fn handle_get_stream(path: &Path, size_hint: usize, compression
     }
 }
 
-pub(crate) async fn handle_put_stream(path: &Path, compression: Compression, config: &Config) -> anyhow::Result<Box<WriteStream>> {
-    let (client, _) = clients()
-        .try_get_with(config.get_hash(), dyn_connect(config)).await
-        .map_err(|e| anyhow!(e))?;
-
+pub(crate) async fn handle_put_stream(client: Client, path: &Path, compression: Compression) -> anyhow::Result<Box<WriteStream>> {
     let writer = object_store::buffered::BufWriter::with_capacity(
-        client,
+        client.store,
         path.clone(),
         10 * 1024 * 1024
     )
@@ -194,7 +184,7 @@ pub extern "C" fn get_stream(
     path: *const c_char,
     size_hint: usize,
     decompress: *const c_char,
-    config: *const Config,
+    config: *const RawConfig,
     response: *mut GetStreamResponse,
     handle: *const c_void
 ) -> CResult {
@@ -452,7 +442,7 @@ impl RawResponse for PutStreamResponse {
 pub extern "C" fn put_stream(
     path: *const c_char,
     compress: *const c_char,
-    config: *const Config,
+    config: *const RawConfig,
     response: *mut PutStreamResponse,
     handle: *const c_void
 ) -> CResult {

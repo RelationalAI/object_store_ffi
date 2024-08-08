@@ -1,33 +1,22 @@
-use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, Request, util::cstr_to_path, Context, RawResponse, ResponseGuard, with_cancellation};
+use crate::{util::cstr_to_path, with_cancellation, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
 
 use object_store::{path::Path, ObjectStore, ObjectMeta};
 
-use anyhow::anyhow;
 use std::ffi::{c_char, c_void, CString};
 use futures_util::{StreamExt, stream::BoxStream};
 use std::sync::Arc;
 
-pub(crate) async fn handle_list(prefix: &Path, config: &Config) -> anyhow::Result<Vec<ObjectMeta>> {
-    let (client, _) = clients()
-        .try_get_with(config.get_hash(), dyn_connect(config))
-        .await
-        .map_err(|e| anyhow!(e))?;
-
-    let stream = client.list(Some(&prefix));
+pub(crate) async fn handle_list(client: Client, prefix: &Path) -> anyhow::Result<Vec<ObjectMeta>> {
+    let stream = client.store.list(Some(&prefix));
 
     let entries: Vec<_> = stream.collect().await;
     let entries = entries.into_iter().collect::<Result<Vec<_>, _>>()?;
     Ok(entries)
 }
 
-pub(crate) async fn handle_list_stream(prefix: &Path, config: &Config) -> anyhow::Result<Box<StreamWrapper>> {
-    let (client, _) = clients()
-        .try_get_with(config.get_hash(), dyn_connect(config))
-        .await
-        .map_err(|e| anyhow!(e))?;
-
+pub(crate) async fn handle_list_stream(client: Client, prefix: &Path) -> anyhow::Result<Box<StreamWrapper>> {
     let mut wrapper = Box::new(StreamWrapper {
-        client,
+        client: client.store,
         stream: None
     });
 
@@ -149,7 +138,7 @@ impl From<object_store::ObjectMeta> for ListEntry {
 #[no_mangle]
 pub extern "C" fn list(
     prefix: *const c_char,
-    config: *const Config,
+    config: *const RawConfig,
     response: *mut ListResponse,
     handle: *const c_void
 ) -> CResult {
@@ -244,7 +233,7 @@ impl RawResponse for ListStreamResponse {
 #[no_mangle]
 pub extern "C" fn list_stream(
     prefix: *const c_char,
-    config: *const Config,
+    config: *const RawConfig,
     response: *mut ListStreamResponse,
     handle: *const c_void
 ) -> CResult {
