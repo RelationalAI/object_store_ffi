@@ -158,8 +158,8 @@ enum Request {
     Get(Path, &'static mut [u8], &'static RawConfig, ResponseGuard<Response>),
     Put(Path, &'static [u8], &'static RawConfig, ResponseGuard<Response>),
     Delete(Path, &'static RawConfig, ResponseGuard<Response>),
-    List(Path, &'static RawConfig, ResponseGuard<ListResponse>),
-    ListStream(Path, &'static RawConfig, ResponseGuard<ListStreamResponse>),
+    List(Path, Option<Path>, &'static RawConfig, ResponseGuard<ListResponse>),
+    ListStream(Path, Option<Path>, &'static RawConfig, ResponseGuard<ListStreamResponse>),
     GetStream(Path, usize, Compression, &'static RawConfig, ResponseGuard<GetStreamResponse>),
     PutStream(Path, Compression, &'static RawConfig, ResponseGuard<PutStreamResponse>)
 }
@@ -566,20 +566,20 @@ pub extern "C" fn start(
                                 false
                             );
                         }
-                        Request::List(prefix, config, response) => {
+                        Request::List(prefix, offset, config, response) => {
                             let client = ensure_client!(response, config);
                             with_retries_and_cancellation!(
                                 client,
                                 response,
-                                handle_list(client.clone(), &prefix)
+                                handle_list(client.clone(), &prefix, offset.as_ref())
                             );
                         }
-                        Request::ListStream(prefix, config, response) => {
+                        Request::ListStream(prefix, offset, config, response) => {
                             let client = ensure_client!(response, config);
                             with_retries_and_cancellation!(
                                 client,
                                 response,
-                                handle_list_stream(client.clone(), &prefix)
+                                handle_list_stream(client.clone(), &prefix, offset.as_ref())
                             );
                         }
                         Request::GetStream(path, size_hint, compression, config, response) => {
