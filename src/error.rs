@@ -1,7 +1,7 @@
 use std::time::Duration;
 use backoff::backoff::Backoff;
+use object_store::RetryConfig;
 use once_cell::sync::Lazy;
-use crate::ConfigMeta;
 use std::error::Error as StdError;
 use anyhow::anyhow;
 
@@ -122,15 +122,15 @@ pub(crate) fn extract_error_info(error: &anyhow::Error) -> ErrorInfo {
 pub(crate) struct RetryState {
     pub(crate) start: std::time::Instant,
     pub(crate) attempts: Vec<ErrorInfo>,
-    pub(crate) config_meta: ConfigMeta
+    pub(crate) retry_config: RetryConfig
 }
 
 impl RetryState {
-    pub(crate) fn new(config_meta: ConfigMeta) -> RetryState {
+    pub(crate) fn new(retry_config: RetryConfig) -> RetryState {
         RetryState {
             start: std::time::Instant::now(),
             attempts: vec![],
-            config_meta
+            retry_config
         }
     }
 
@@ -145,8 +145,8 @@ impl RetryState {
         // We try to use the same settings as the object_store backoff but the implementation is
         // different so this is best effort.
         let mut backoff = backoff::ExponentialBackoff {
-            initial_interval: self.config_meta.retry_config.backoff.init_backoff,
-            max_interval: self.config_meta.retry_config.backoff.max_backoff,
+            initial_interval: self.retry_config.backoff.init_backoff,
+            max_interval: self.retry_config.backoff.max_backoff,
             ..Default::default()
         };
 
@@ -155,7 +155,7 @@ impl RetryState {
             let _ = backoff.next_backoff();
         }
 
-        backoff.next_backoff().unwrap_or(self.config_meta.retry_config.backoff.max_backoff)
+        backoff.next_backoff().unwrap_or(self.retry_config.backoff.max_backoff)
     }
 
     fn log_attempt(&mut self, info: ErrorInfo) {
@@ -163,8 +163,8 @@ impl RetryState {
     }
 
     pub(crate) fn should_retry_logic(&self) -> bool {
-        let max_retries = self.config_meta.retry_config.max_retries;
-        let retry_timeout = self.config_meta.retry_config.retry_timeout;
+        let max_retries = self.retry_config.max_retries;
+        let retry_timeout = self.retry_config.retry_timeout;
         let elapsed = self.start.elapsed();
         let all_retries = self.retries();
 

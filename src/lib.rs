@@ -1,7 +1,6 @@
 #[global_allocator]
 static GLOBAL: metrics::InstrumentedAllocator = metrics::InstrumentedAllocator {};
 
-// use futures_util::StreamExt;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
@@ -47,7 +46,7 @@ static SQ: OnceCell<flume::Sender<Request>> = OnceCell::new();
 // The ObjectStore objects contain the context for communicating with a particular
 // storage bucket/account, including authentication info. This caches them so we do
 // not need to pay the construction cost for each request.
-static CLIENTS: OnceCell<Cache<u64, (Arc<dyn ObjectStore>, ConfigMeta)>> = OnceCell::new();
+static CLIENTS: OnceCell<Cache<u64, Client>> = OnceCell::new();
 
 // Contains configuration items that are set during initialization and do not change.
 static STATIC_CONFIG: OnceCell<StaticConfig> = OnceCell::new();
@@ -61,7 +60,7 @@ fn runtime() -> &'static Runtime {
     RT.get().expect("start was not called")
 }
 
-fn clients() -> &'static Cache<u64, (Arc<dyn ObjectStore>, ConfigMeta)> {
+fn clients() -> &'static Cache<u64, Client> {
     CLIENTS.get().expect("start was not called")
 }
 
@@ -156,13 +155,13 @@ unsafe impl<T: RawResponse> Send for ResponseGuard<T> {}
 // The types used for our internal dispatch mechanism, for dispatching Julia requests
 // to our worker task.
 enum Request {
-    Get(Path, &'static mut [u8], &'static Config, ResponseGuard<Response>),
-    Put(Path, &'static [u8], &'static Config, ResponseGuard<Response>),
-    Delete(Path, &'static Config, ResponseGuard<Response>),
-    List(Path, &'static Config, ResponseGuard<ListResponse>),
-    ListStream(Path, &'static Config, ResponseGuard<ListStreamResponse>),
-    GetStream(Path, usize, Compression, &'static Config, ResponseGuard<GetStreamResponse>),
-    PutStream(Path, Compression, &'static Config, ResponseGuard<PutStreamResponse>)
+    Get(Path, &'static mut [u8], &'static RawConfig, ResponseGuard<Response>),
+    Put(Path, &'static [u8], &'static RawConfig, ResponseGuard<Response>),
+    Delete(Path, &'static RawConfig, ResponseGuard<Response>),
+    List(Path, Option<Path>, &'static RawConfig, ResponseGuard<ListResponse>),
+    ListStream(Path, Option<Path>, &'static RawConfig, ResponseGuard<ListStreamResponse>),
+    GetStream(Path, usize, Compression, &'static RawConfig, ResponseGuard<GetStreamResponse>),
+    PutStream(Path, Compression, &'static RawConfig, ResponseGuard<PutStreamResponse>)
 }
 
 unsafe impl Send for Request {}
@@ -171,6 +170,7 @@ unsafe impl Send for Request {}
 // the Base.Event that is waiting for the Rust result.
 // Note that this will be linked in from the Julia process, we do not try
 // to link it while building this Rust lib.
+#[cfg(feature = "julia")]
 extern "C" {
     fn jl_adopt_thread() -> i32;
     fn jl_gc_safe_enter() -> i32;
@@ -181,14 +181,14 @@ extern "C" {
 // It has a single field `config_string` that must be a JSON serialized
 // object with string keys and values.
 #[repr(C)]
-pub struct Config {
+pub struct RawConfig {
     config_string: *const c_char
 }
 
-unsafe impl Send for Config {}
-unsafe impl Sync for Config {}
+unsafe impl Send for RawConfig {}
+unsafe impl Sync for RawConfig {}
 
-impl Config {
+impl RawConfig {
     fn get_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         let config_string = self.as_str();
@@ -217,20 +217,77 @@ impl Config {
 }
 
 #[derive(Debug, Clone)]
-struct ConfigMeta {
+struct Config {
     retry_config: RetryConfig
 }
 
-async fn get_config_meta_or_parse(config: &Config) -> anyhow::Result<ConfigMeta> {
-    let meta = match clients().get(&config.get_hash()).await {
-        Some((_, meta)) => meta,
-        None => {
-            let mut map = config.as_map()?;
-            ConfigMeta { retry_config: parse_retry_config(&mut map)? }
-        }
-    };
+#[derive(Debug, Clone)]
+pub struct Client {
+    store: Arc<dyn ObjectStore>,
+    config: Config
+}
 
-    Ok(meta)
+impl Client {
+    // Caution: This function is not retried as it does not perform any network
+    // operations currently. If this invariant no longer holds retries must be
+    // added here
+    async fn from_raw_config(config: &RawConfig) -> anyhow::Result<Client> {
+        let mut map = config.as_map()?;
+
+        let url = map.remove("url")
+            .ok_or(anyhow!("config object must have a key named 'url'"))?;
+
+        let url = url::Url::parse(&url)
+            .map_err(|e| anyhow!("failed to parse `url`: {}", e))?;
+
+        if let Some(v) = map.remove("azurite_host") {
+            let mut azurite_host = url::Url::parse(&v)
+                .map_err(|e| anyhow!("failed to parse azurite_host: {}", e))?;
+            azurite_host.set_path("");
+            unsafe { std::env::set_var("AZURITE_BLOB_STORAGE_URL", azurite_host.as_str()) };
+            map.insert("allow_invalid_certificates".into(), "true".into());
+            map.insert("azure_storage_use_emulator".into(), "true".into());
+        }
+
+        if let Some(v) = map.remove("minio_host") {
+            let mut minio_host = url::Url::parse(&v)
+                .map_err(|e| anyhow!("failed to parse minio_host: {}", e))?;
+            minio_host.set_path("");
+            map.insert("allow_http".into(), "true".into());
+            map.insert("aws_endpoint".into(), minio_host.as_str().trim_end_matches('/').to_string());
+        }
+
+        let retry_config = parse_retry_config(&mut map)?;
+
+        let store: Arc<dyn ObjectStore> = match url.scheme() {
+            "s3" => {
+                let mut builder = object_store::aws::AmazonS3Builder::default()
+                    .with_url(url)
+                    .with_retry(retry_config.clone());
+                for (key, value) in map {
+                    builder = builder.with_config(key.parse()?, value);
+                }
+                Arc::new(builder.build()?)
+            }
+            "az" | "azure" => {
+                let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
+                    .with_url(url)
+                    .with_retry(retry_config.clone());
+                for (key, value) in map {
+                    builder = builder.with_config(key.parse()?, value);
+                }
+                Arc::new(builder.build()?)
+            }
+            _ => unimplemented!("unknown url scheme")
+        };
+
+        Ok(Client {
+            store,
+            config: Config {
+                retry_config
+            }
+        })
+    }
 }
 
 fn parse_retry_config(map: &mut HashMap<String, String>) -> anyhow::Result<RetryConfig> {
@@ -262,59 +319,6 @@ fn parse_retry_config(map: &mut HashMap<String, String>) -> anyhow::Result<Retry
     Ok(retry_config)
 }
 
-async fn dyn_connect(config: &Config) -> anyhow::Result<(Arc<dyn ObjectStore>, ConfigMeta)> {
-    let mut map = config.as_map()?;
-
-    let url = map.remove("url")
-        .ok_or(anyhow!("config object must have a key named 'url'"))?;
-
-    let url = url::Url::parse(&url)
-        .map_err(|e| anyhow!("failed to parse `url`: {}", e))?;
-
-    if let Some(v) = map.remove("azurite_host") {
-        let mut azurite_host = url::Url::parse(&v)
-            .map_err(|e| anyhow!("failed to parse azurite_host: {}", e))?;
-        azurite_host.set_path("");
-        std::env::set_var("AZURITE_BLOB_STORAGE_URL", azurite_host.as_str());
-        map.insert("allow_invalid_certificates".into(), "true".into());
-        map.insert("azure_storage_use_emulator".into(), "true".into());
-    }
-
-    if let Some(v) = map.remove("minio_host") {
-        let mut minio_host = url::Url::parse(&v)
-            .map_err(|e| anyhow!("failed to parse minio_host: {}", e))?;
-        minio_host.set_path("");
-        map.insert("allow_http".into(), "true".into());
-        map.insert("aws_endpoint".into(), minio_host.as_str().trim_end_matches('/').to_string());
-    }
-
-    let retry_config = parse_retry_config(&mut map)?;
-
-    let client: Arc<dyn ObjectStore> = match url.scheme() {
-        "s3" => {
-            let mut builder = object_store::aws::AmazonS3Builder::default()
-                .with_url(url)
-                .with_retry(retry_config.clone());
-            for (key, value) in map {
-                builder = builder.with_config(key.parse()?, value);
-            }
-            Arc::new(builder.build()?)
-        }
-        "az" | "azure" => {
-            let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
-                .with_url(url)
-                .with_retry(retry_config.clone());
-            for (key, value) in map {
-                builder = builder.with_config(key.parse()?, value);
-            }
-            Arc::new(builder.build()?)
-        }
-        _ => unimplemented!("unknown url scheme")
-    };
-
-    Ok((client, ConfigMeta { retry_config }))
-}
-
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct StaticConfig {
@@ -343,19 +347,30 @@ impl Default for StaticConfig {
     }
 }
 
-macro_rules! with_retries_and_cancellation {
-    ($op:expr, $response:expr, $config: expr) => {
-        with_retries_and_cancellation!($op, $response, $config, true)
-    };
-    ($op:expr, $response:expr, $config: expr, $emit_warn: expr) => {
-        let meta = match get_config_meta_or_parse($config).await {
-            Ok(meta) => meta,
+macro_rules! ensure_client {
+    ($response: expr, $config: expr) => {
+        match clients()
+            .try_get_with($config.get_hash(), Client::from_raw_config($config)).await
+            .map_err(|e| anyhow!(e))
+        {
+            Ok(client) => {
+                client
+            },
             Err(e) => {
+                tracing::warn!("{}", e);
                 $response.into_error(e);
-                return;
+                continue;
             }
-        };
-        let mut retry_state = RetryState::new(meta);
+        }
+    };
+}
+
+macro_rules! with_retries_and_cancellation {
+    ($client:expr, $response:expr, $op: expr) => {
+        with_retries_and_cancellation!($client, $response, $op, true)
+    };
+    ($client:expr, $response:expr, $op: expr, $emit_warn: expr) => {
+        let mut retry_state = RetryState::new($client.config.retry_config.clone());
         'retry: loop {
             $response.ensure_active();
             tokio::select! {
@@ -470,7 +485,7 @@ pub extern "C" fn start(
     }));
 
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "object_store_ffi=warn,object_store=warn")
+        unsafe { std::env::set_var("RUST_LOG", "object_store_ffi=warn,object_store=warn") }
     }
 
     tracing_subscriber::fmt::init();
@@ -478,8 +493,11 @@ pub extern "C" fn start(
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
     rt_builder.on_thread_start(|| {
-        unsafe { jl_adopt_thread() };
-        unsafe { jl_gc_safe_enter() };
+        #[cfg(feature = "julia")]
+        {
+            unsafe { jl_adopt_thread() };
+            unsafe { jl_gc_safe_enter() };
+        }
     });
 
     let n_threads = static_config().n_threads;
@@ -504,14 +522,14 @@ pub extern "C" fn start(
     CLIENTS.set(cache)
         .expect("cache was set before");
 
+    let (tx, rx) = flume::bounded(32 * 1024);
+    SQ.set(tx).expect("runtime already started");
+
     // Creates our main dispatch task that takes Julia requests from the queue and does the
     // operations (GET, PUT...). We run `concurrency_limit` concurrent tasks which all pop from
     // the request queue in an async manner. Previously we used a stream and `buffer_unordered` but
     // it was unable to keep all tasks running concurrently.
     runtime().spawn(async move {
-        let (tx, rx) = flume::bounded(32 * 1024);
-        SQ.set(tx).expect("runtime already started");
-
         for _i in 0..static_config().concurrency_limit {
             let rx = rx.clone();
             tokio::spawn(async move {
@@ -524,53 +542,60 @@ pub extern "C" fn start(
                     };
                     match req {
                         Request::Get(path, slice, config, response) => {
+                            let client = ensure_client!(response, config);
                             with_retries_and_cancellation!(
-                                handle_get(slice, &path, config),
+                                client,
                                 response,
-                                config
+                                handle_get(client.clone(), slice, &path)
                             );
                         }
                         Request::Put(path, slice, config, response) => {
+                            let client = ensure_client!(response, config);
                             with_retries_and_cancellation!(
-                                handle_put(slice, &path, config),
+                                client,
                                 response,
-                                config
+                                handle_put(client.clone(), slice, &path)
                             );
                         }
                         Request::Delete(path, config, response) => {
+                            let client = ensure_client!(response, config);
                             with_retries_and_cancellation!(
-                                handle_delete(&path, config),
+                                client,
                                 response,
-                                config,
+                                handle_delete(client.clone(), &path),
                                 false
                             );
                         }
-                        Request::List(prefix, config, response) => {
+                        Request::List(prefix, offset, config, response) => {
+                            let client = ensure_client!(response, config);
                             with_retries_and_cancellation!(
-                                handle_list(&prefix, config),
+                                client,
                                 response,
-                                config
+                                handle_list(client.clone(), &prefix, offset.as_ref())
                             );
                         }
-                        Request::ListStream(prefix, config, response) => {
+                        Request::ListStream(prefix, offset, config, response) => {
+                            let client = ensure_client!(response, config);
                             with_retries_and_cancellation!(
-                                handle_list_stream(&prefix, config),
+                                client,
                                 response,
-                                config
+                                handle_list_stream(client.clone(), &prefix, offset.as_ref())
                             );
                         }
                         Request::GetStream(path, size_hint, compression, config, response) => {
+                            let client = ensure_client!(response, config);
                             with_retries_and_cancellation!(
-                                handle_get_stream(&path, size_hint, compression, config),
+                                client,
                                 response,
-                                config
+                                handle_get_stream(client.clone(), &path, size_hint, compression)
                             );
                         }
                         Request::PutStream(path, compression, config, response) => {
+                            let client = ensure_client!(response, config);
                             with_retries_and_cancellation!(
-                                handle_put_stream(&path, compression, config),
+                                client,
                                 response,
-                                config
+                                handle_put_stream(client.clone(), &path, compression)
                             );
                         }
                     }

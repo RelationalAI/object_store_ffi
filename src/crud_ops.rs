@@ -1,4 +1,4 @@
-use crate::{CResult, Config, NotifyGuard, SQ, clients, dyn_connect, static_config, Request, util::cstr_to_path, Context, RawResponse, ResponseGuard};
+use crate::{CResult, Client, RawConfig, NotifyGuard, SQ, static_config, Request, util::cstr_to_path, Context, RawResponse, ResponseGuard};
 
 use object_store::{path::Path, ObjectStore};
 
@@ -6,7 +6,6 @@ use anyhow::anyhow;
 use std::ffi::{c_char, c_void};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
-use std::sync::Arc;
 
 // The type used to give Julia the result of an async request. It will be allocated
 // by Julia as part of the request and filled in by Rust.
@@ -43,15 +42,15 @@ impl RawResponse for Response {
     }
 }
 
-async fn multipart_get(slice: &mut [u8], path: &Path, client: &dyn ObjectStore) -> anyhow::Result<usize> {
-    let result = client.head(&path).await?;
+async fn multipart_get(slice: &mut [u8], path: &Path, client: &Client) -> anyhow::Result<usize> {
+    let result = client.store.head(&path).await?;
     if result.size > slice.len() {
         return Err(anyhow!("Supplied buffer was too small"));
     }
 
     let part_ranges = crate::util::size_to_ranges(result.size);
 
-    let result_vec = client.get_ranges(&path, &part_ranges).await?;
+    let result_vec = client.store.get_ranges(&path, &part_ranges).await?;
     let mut accum: usize = 0;
     for i in 0..result_vec.len() {
         slice[accum..accum + result_vec[i].len()].copy_from_slice(&result_vec[i]);
@@ -61,9 +60,9 @@ async fn multipart_get(slice: &mut [u8], path: &Path, client: &dyn ObjectStore) 
     return Ok(accum);
 }
 
-async fn multipart_put(slice: &[u8], path: &Path, client: Arc<dyn ObjectStore>) -> anyhow::Result<()> {
+async fn multipart_put(slice: &[u8], path: &Path, client: Client) -> anyhow::Result<()> {
     let mut writer = object_store::buffered::BufWriter::with_capacity(
-        client,
+        client.store,
         path.clone(),
         10 * 1024 * 1024
     )
@@ -88,11 +87,7 @@ async fn multipart_put(slice: &[u8], path: &Path, client: Arc<dyn ObjectStore>) 
     };
 }
 
-pub(crate) async fn handle_get(slice: &mut [u8], path: &Path, config: &Config) -> anyhow::Result<usize> {
-    let (client, _) = clients()
-        .try_get_with(config.get_hash(), dyn_connect(config)).await
-        .map_err(|e| anyhow!(e))?;
-
+pub(crate) async fn handle_get(client: Client, slice: &mut [u8], path: &Path) -> anyhow::Result<usize> {
     // Multipart Get
     if slice.len() > static_config().multipart_get_threshold as usize {
         let accum = multipart_get(slice, path, &client).await?;
@@ -100,7 +95,7 @@ pub(crate) async fn handle_get(slice: &mut [u8], path: &Path, config: &Config) -
     }
 
     // Single part Get
-    let body = client.get(path).await?;
+    let body = client.store.get(path).await?;
     let mut batch_stream = body.into_stream().chunks(8);
 
     let mut received_bytes = 0;
@@ -129,14 +124,10 @@ pub(crate) async fn handle_get(slice: &mut [u8], path: &Path, config: &Config) -
     Ok(received_bytes)
 }
 
-pub(crate) async fn handle_put(slice: &'static [u8], path: &Path, config: &Config) -> anyhow::Result<usize> {
-    let (client, _) = clients()
-        .try_get_with(config.get_hash(), dyn_connect(config)).await
-        .map_err(|e| anyhow!(e))?;
-
+pub(crate) async fn handle_put(client: Client, slice: &'static [u8], path: &Path) -> anyhow::Result<usize> {
     let len = slice.len();
     if len < static_config().multipart_put_threshold as usize {
-        let _ = client.put(path, slice.into()).await?;
+        let _ = client.store.put(path, slice.into()).await?;
     } else {
         let _ = multipart_put(slice, path, client).await?;
     }
@@ -144,12 +135,8 @@ pub(crate) async fn handle_put(slice: &'static [u8], path: &Path, config: &Confi
     Ok(len)
 }
 
-pub(crate) async fn handle_delete(path: &Path, config: &Config) -> anyhow::Result<usize> {
-    let (client, _) = clients()
-        .try_get_with(config.get_hash(), dyn_connect(config)).await
-        .map_err(|e| anyhow!(e))?;
-
-    client.delete(path).await?;
+pub(crate) async fn handle_delete(client: Client, path: &Path) -> anyhow::Result<usize> {
+    client.store.delete(path).await?;
 
     Ok(0)
 }
@@ -159,7 +146,7 @@ pub extern "C" fn get(
     path: *const c_char,
     buffer: *mut u8,
     size: usize,
-    config: *const Config,
+    config: *const RawConfig,
     response: *mut Response,
     handle: *const c_void
 ) -> CResult {
@@ -195,7 +182,7 @@ pub extern "C" fn put(
     path: *const c_char,
     buffer: *const u8,
     size: usize,
-    config: *const Config,
+    config: *const RawConfig,
     response: *mut Response,
     handle: *const c_void
 ) -> CResult {
@@ -229,7 +216,7 @@ pub extern "C" fn put(
 #[no_mangle]
 pub extern "C" fn delete(
     path: *const c_char,
-    config: *const Config,
+    config: *const RawConfig,
     response: *mut Response,
     handle: *const c_void
 ) -> CResult {

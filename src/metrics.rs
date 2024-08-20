@@ -68,7 +68,7 @@ unsafe impl GlobalAlloc for InstrumentedAllocator {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         LOCAL_METRICS.with(|cell| {
-            let live_bytes = cell.get() + (new_size - layout.size()) as i64;
+            let live_bytes = cell.get() + (new_size as i64) - (layout.size() as i64);
             if live_bytes.abs() < 100 * 1024 {
                 cell.set(live_bytes);
             } else {

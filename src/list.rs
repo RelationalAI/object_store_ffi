@@ -1,38 +1,34 @@
-use crate::{CResult, Config, NotifyGuard, SQ, RT, clients, dyn_connect, Request, util::cstr_to_path, Context, RawResponse, ResponseGuard, with_cancellation};
+use crate::{util::cstr_to_path, with_cancellation, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
 
 use object_store::{path::Path, ObjectStore, ObjectMeta};
 
-use anyhow::anyhow;
 use std::ffi::{c_char, c_void, CString};
 use futures_util::{StreamExt, stream::BoxStream};
 use std::sync::Arc;
 
-pub(crate) async fn handle_list(prefix: &Path, config: &Config) -> anyhow::Result<Vec<ObjectMeta>> {
-    let (client, _) = clients()
-        .try_get_with(config.get_hash(), dyn_connect(config))
-        .await
-        .map_err(|e| anyhow!(e))?;
-
-    let stream = client.list(Some(&prefix));
+pub(crate) async fn handle_list(client: Client, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<Vec<ObjectMeta>> {
+    let stream = if let Some(offset) = offset {
+        client.store.list_with_offset(Some(&prefix), offset)
+    } else {
+        client.store.list(Some(&prefix))
+    };
 
     let entries: Vec<_> = stream.collect().await;
     let entries = entries.into_iter().collect::<Result<Vec<_>, _>>()?;
     Ok(entries)
 }
 
-pub(crate) async fn handle_list_stream(prefix: &Path, config: &Config) -> anyhow::Result<Box<StreamWrapper>> {
-    let (client, _) = clients()
-        .try_get_with(config.get_hash(), dyn_connect(config))
-        .await
-        .map_err(|e| anyhow!(e))?;
-
+pub(crate) async fn handle_list_stream(client: Client, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<Box<StreamWrapper>> {
     let mut wrapper = Box::new(StreamWrapper {
-        client,
+        client: client.store,
         stream: None
     });
 
-    let stream = wrapper.client.list(Some(&prefix)).chunks(1000).boxed();
-
+    let stream = if let Some(offset) = offset {
+        wrapper.client.list_with_offset(Some(&prefix), offset).chunks(1000).boxed()
+    } else {
+        wrapper.client.list(Some(&prefix)).chunks(1000).boxed()
+    };
     // Safety: This is needed because the compiler cannot infer that the stream
     // will outlive the client. We ensure this happens
     // by droping the stream before droping the Arc on destroy_list_stream
@@ -149,23 +145,29 @@ impl From<object_store::ObjectMeta> for ListEntry {
 #[no_mangle]
 pub extern "C" fn list(
     prefix: *const c_char,
-    config: *const Config,
+    offset: *const c_char,
+    config: *const RawConfig,
     response: *mut ListResponse,
     handle: *const c_void
 ) -> CResult {
     let response = unsafe { ResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
     let prefix = unsafe{ cstr_to_path(prefix) };
+    let offset = if offset.is_null() {
+        None
+    } else {
+        Some(unsafe { cstr_to_path(std::ffi::CStr::from_ptr(offset)) })
+    };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
-            match sq.try_send(Request::List(prefix, config, response)) {
+            match sq.try_send(Request::List(prefix, offset, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(flume::TrySendError::Full(Request::List(_, _, response))) => {
+                Err(flume::TrySendError::Full(Request::List(_, _, _, response))) => {
                     response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(flume::TrySendError::Disconnected(Request::List(_, _, response))) => {
+                Err(flume::TrySendError::Disconnected(Request::List(_, _, _, response))) => {
                     response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
@@ -244,23 +246,29 @@ impl RawResponse for ListStreamResponse {
 #[no_mangle]
 pub extern "C" fn list_stream(
     prefix: *const c_char,
-    config: *const Config,
+    offset: *const c_char,
+    config: *const RawConfig,
     response: *mut ListStreamResponse,
     handle: *const c_void
 ) -> CResult {
     let response = unsafe { ResponseGuard::new(response, handle) };
     let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
     let prefix = unsafe{ cstr_to_path(prefix) };
+    let offset = if offset.is_null() {
+        None
+    } else {
+        Some(unsafe { cstr_to_path(std::ffi::CStr::from_ptr(offset)) })
+    };
     let config = unsafe { & (*config) };
     match SQ.get() {
         Some(sq) => {
-            match sq.try_send(Request::ListStream(prefix, config, response)) {
+            match sq.try_send(Request::ListStream(prefix, offset, config, response)) {
                 Ok(_) => CResult::Ok,
-                Err(flume::TrySendError::Full(Request::ListStream(_, _, response))) => {
+                Err(flume::TrySendError::Full(Request::ListStream(_, _, _, response))) => {
                     response.into_error("object_store_ffi internal channel full, backoff");
                     CResult::Backoff
                 }
-                Err(flume::TrySendError::Disconnected(Request::ListStream(_, _, response))) => {
+                Err(flume::TrySendError::Disconnected(Request::ListStream(_, _, _, response))) => {
                     response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
                     CResult::Error
                 }
