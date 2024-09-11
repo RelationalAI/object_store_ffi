@@ -7,7 +7,9 @@ use futures_util::{StreamExt, stream::BoxStream};
 use std::sync::Arc;
 
 pub(crate) async fn handle_list(client: Client, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<Vec<ObjectMeta>> {
+    let prefix = &client.full_path(prefix);
     let stream = if let Some(offset) = offset {
+        let offset = &client.full_path(offset);
         client.store.list_with_offset(Some(&prefix), offset)
     } else {
         client.store.list(Some(&prefix))
@@ -19,12 +21,14 @@ pub(crate) async fn handle_list(client: Client, prefix: &Path, offset: Option<&P
 }
 
 pub(crate) async fn handle_list_stream(client: Client, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<Box<StreamWrapper>> {
+    let prefix = &client.full_path(prefix);
     let mut wrapper = Box::new(StreamWrapper {
-        client: client.store,
+        client: client.store.clone(),
         stream: None
     });
 
     let stream = if let Some(offset) = offset {
+        let offset = &client.full_path(offset);
         wrapper.client.list_with_offset(Some(&prefix), offset).chunks(1000).boxed()
     } else {
         wrapper.client.list(Some(&prefix)).chunks(1000).boxed()

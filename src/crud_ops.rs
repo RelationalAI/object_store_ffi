@@ -1,11 +1,12 @@
-use crate::{CResult, Client, RawConfig, NotifyGuard, SQ, static_config, Request, util::cstr_to_path, Context, RawResponse, ResponseGuard};
+use crate::{encryption::{encrypt, CrypterReader, CrypterWriter, Mode}, static_config, util::cstr_to_path, BoxedReader, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, SQ};
 
 use object_store::{path::Path, ObjectStore};
 
 use anyhow::anyhow;
+use tokio_util::io::StreamReader;
 use std::ffi::{c_char, c_void};
-use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
+use futures_util::{stream, StreamExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 // The type used to give Julia the result of an async request. It will be allocated
 // by Julia as part of the request and filled in by Rust.
@@ -42,31 +43,82 @@ impl RawResponse for Response {
     }
 }
 
+async fn read_to_slice(reader: &mut Box<dyn AsyncRead + Send + Unpin>, mut slice: &mut [u8]) -> anyhow::Result<usize> {
+    let mut received_bytes = 0;
+    loop {
+        match reader.read_buf(&mut slice).await {
+            Ok(0) => {
+                if slice.len() == 0 {
+                    // TODO is there a better way to check for this?
+                    let mut scratch = [0u8; 1];
+                    if let Ok(0) = reader.read_buf(&mut scratch.as_mut_slice()).await {
+                        // slice was the exact size, done
+                        break;
+                    } else {
+                        return Err(anyhow!("Supplied buffer was too small"));
+                    }
+                } else {
+                    // done
+                    break;
+                }
+            }
+            Ok(n) => received_bytes += n,
+            Err(e) => {
+                let err = anyhow::Error::new(e);
+                tracing::warn!("Error while reading body: {:#}", err);
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(received_bytes)
+}
+
 async fn multipart_get(slice: &mut [u8], path: &Path, client: &Client) -> anyhow::Result<usize> {
-    let result = client.store.head(&path).await?;
-    if result.size > slice.len() {
-        return Err(anyhow!("Supplied buffer was too small"));
-    }
+    let result = client.store.get_opts(
+        &path,
+        object_store::GetOptions {
+            head: true,
+            ..Default::default()
+        }
+    ).await?;
 
-    let part_ranges = crate::util::size_to_ranges(result.size);
-
+    let part_ranges = crate::util::size_to_ranges(result.meta.size);
     let result_vec = client.store.get_ranges(&path, &part_ranges).await?;
-    let mut accum: usize = 0;
-    for i in 0..result_vec.len() {
-        slice[accum..accum + result_vec[i].len()].copy_from_slice(&result_vec[i]);
-        accum += result_vec[i].len();
+    let mut reader: BoxedReader = Box::new(StreamReader::new(stream::iter(result_vec).map(|b| Ok::<_, std::io::Error>(b))));
+
+    if let Some(cryptmp) = client.crypto_material_provider.as_ref() {
+        let material = cryptmp.material_from_metadata(path.as_ref(), &result.attributes).await?;
+        let decrypter_reader = CrypterReader::new(reader, Mode::Decrypt, &material)?;
+        reader = Box::new(decrypter_reader);
     }
 
-    return Ok(accum);
+    Ok(read_to_slice(&mut reader, slice).await?)
 }
 
 async fn multipart_put(slice: &[u8], path: &Path, client: Client) -> anyhow::Result<()> {
-    let mut writer = object_store::buffered::BufWriter::with_capacity(
-        client.store,
-        path.clone(),
-        10 * 1024 * 1024
-    )
-        .with_max_concurrency(64);
+    let mut writer: BoxedUpload = if let Some(cryptmp) = client.crypto_material_provider.as_ref() {
+        let (material, attrs) = cryptmp.material_for_write(path.as_ref(), Some(slice.len())).await?;
+        let writer = object_store::buffered::BufWriter::with_capacity(
+            client.store,
+            path.clone(),
+            10 * 1024 * 1024
+        )
+            .with_attributes(attrs)
+            .with_max_concurrency(64);
+        let encrypter_writer = CrypterWriter::new(writer, Mode::Encrypt, &material)?;
+        Box::new(encrypter_writer)
+    } else {
+        Box::new(
+            object_store::buffered::BufWriter::with_capacity(
+                client.store,
+                path.clone(),
+                10 * 1024 * 1024
+            )
+            .with_max_concurrency(64)
+        )
+    };
+
     match writer.write_all(slice).await {
         Ok(_) => {
             match writer.flush().await {
@@ -88,6 +140,8 @@ async fn multipart_put(slice: &[u8], path: &Path, client: Client) -> anyhow::Res
 }
 
 pub(crate) async fn handle_get(client: Client, slice: &mut [u8], path: &Path) -> anyhow::Result<usize> {
+    let path = &client.full_path(path);
+
     // Multipart Get
     if slice.len() > static_config().multipart_get_threshold as usize {
         let accum = multipart_get(slice, path, &client).await?;
@@ -95,39 +149,35 @@ pub(crate) async fn handle_get(client: Client, slice: &mut [u8], path: &Path) ->
     }
 
     // Single part Get
-    let body = client.store.get(path).await?;
-    let mut batch_stream = body.into_stream().chunks(8);
+    let result = client.store.get(path).await?;
+    let attributes = result.attributes.clone();
 
-    let mut received_bytes = 0;
-    while let Some(batch) = batch_stream.next().await {
-        for result in batch {
-            let chunk = match result {
-                Ok(c) => c,
-                Err(e) => {
-                    let err = anyhow::Error::new(e);
-                    tracing::warn!("Error while fetching a chunk: {:#}", err);
-                    return Err(err);
-                }
-            };
+    let mut reader: Box<dyn AsyncRead + Send + Unpin> = Box::new(StreamReader::new(result.into_stream()));
 
-            let len = chunk.len();
-
-            if received_bytes + len > slice.len() {
-                return Err(anyhow!("Supplied buffer was too small"));
-            }
-
-            slice[received_bytes..(received_bytes + len)].copy_from_slice(&chunk);
-            received_bytes += len;
-        }
+    if let Some(cryptmp) = client.crypto_material_provider.as_ref() {
+        let material = cryptmp.material_from_metadata(path.as_ref(), &attributes).await?;
+        let decrypter_reader = CrypterReader::new(reader, Mode::Decrypt, &material)?;
+        reader = Box::new(decrypter_reader);
     }
 
-    Ok(received_bytes)
+    Ok(read_to_slice(&mut reader, slice).await?)
 }
 
 pub(crate) async fn handle_put(client: Client, slice: &'static [u8], path: &Path) -> anyhow::Result<usize> {
+    let path = &client.full_path(path);
     let len = slice.len();
     if len < static_config().multipart_put_threshold as usize {
-        let _ = client.store.put(path, slice.into()).await?;
+        if let Some(cryptmp) = client.crypto_material_provider.as_ref() {
+            let (material, attrs) = cryptmp.material_for_write(path.as_ref(), Some(slice.len())).await?;
+            let ciphertext = encrypt(&slice, &material).unwrap();
+            let _ = client.store.put_opts(
+                path,
+                ciphertext.into(),
+                attrs.into()
+            ).await?;
+        } else {
+            let _ = client.store.put(path, slice.into()).await?;
+        }
     } else {
         let _ = multipart_put(slice, path, client).await?;
     }
@@ -136,6 +186,7 @@ pub(crate) async fn handle_put(client: Client, slice: &'static [u8], path: &Path
 }
 
 pub(crate) async fn handle_delete(client: Client, path: &Path) -> anyhow::Result<usize> {
+    let path = &client.full_path(path);
     client.store.delete(path).await?;
 
     Ok(0)

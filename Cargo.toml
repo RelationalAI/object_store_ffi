@@ -18,7 +18,7 @@ bench = false
 
 # https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.release]
-debug = 1
+debug = true
 
 [features]
 default = ["julia"]
@@ -51,6 +51,13 @@ flate2 = { version = "1.0.28", features=["zlib-ng"], default-features = false}
 async-compression = { version = "0.4.6", default-features = false, features = ["tokio", "gzip", "zlib", "deflate", "zstd"] }
 flume = "0.11.0"
 pin-project = "1.1.5"
+uuid = { version = "1.10.0", features = ["v4"] }
+openssl = "0.10.66"
+base64 = "0.22.1"
+rand = "0.8.5"
+zeroize = "1.8.1"
+async-trait = "0.1.81"
+serde_path_to_error = "0.1.16"
 
 [dev-dependencies]
 criterion = { version = "0.4", default-features = false, features = ["cargo_bench_support", "html_reports"] }

@@ -1,8 +1,10 @@
 #[global_allocator]
 static GLOBAL: metrics::InstrumentedAllocator = metrics::InstrumentedAllocator {};
 
+use encryption::CryptoMaterialProvider;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
+use tokio::io::AsyncRead;
 use tokio::runtime::Runtime;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use std::collections::HashMap;
@@ -19,10 +21,11 @@ use object_store::{path::Path, ObjectStore};
 use moka::future::Cache;
 
 mod util;
-use util::Compression;
+use util::{string_to_path, AsyncUpload, Compression};
 
 mod error;
 use error::RetryState;
+pub(crate) use error::Result;
 
 mod list;
 use list::{handle_list, handle_list_stream, ListResponse, ListStreamResponse};
@@ -35,6 +38,11 @@ use stream::{handle_get_stream, handle_put_stream, GetStreamResponse, PutStreamR
 
 mod metrics;
 pub use metrics::{InstrumentedAllocator, METRICS};
+
+mod snowflake;
+use snowflake::build_store_for_snowflake_stage;
+
+mod encryption;
 
 // Our global variables needed by our library at runtime. Note that we follow Rust's
 // safety rules here by making them immutable with write-exactly-once semantics using
@@ -71,6 +79,9 @@ fn static_config() -> &'static StaticConfig {
 fn result_cb(handle: *const c_void) -> i32 {
     unsafe { RESULT_CB.get().expect("no result callback")(handle) }
 }
+
+type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
+type BoxedUpload = Box<dyn AsyncUpload + Send + Unpin>;
 
 // The result type used for the API functions exposed to Julia. This is used for both
 // synchronous errors, e.g. our dispatch channel is full, and for async errors such
@@ -218,12 +229,14 @@ impl RawConfig {
 
 #[derive(Debug, Clone)]
 struct Config {
+    prefix: Option<String>,
     retry_config: RetryConfig
 }
 
 #[derive(Debug, Clone)]
 pub struct Client {
     store: Arc<dyn ObjectStore>,
+    crypto_material_provider: Option<Arc<dyn CryptoMaterialProvider>>,
     config: Config
 }
 
@@ -259,7 +272,11 @@ impl Client {
 
         let retry_config = parse_retry_config(&mut map)?;
 
-        let store: Arc<dyn ObjectStore> = match url.scheme() {
+        let user_prefix = map.remove("prefix");
+
+        type StoreTuple = (Arc<dyn ObjectStore>, Option<Arc<dyn CryptoMaterialProvider>>, Option<String>);
+
+        let (store, crypto_material_provider, store_prefix): StoreTuple = match url.scheme() {
             "s3" => {
                 let mut builder = object_store::aws::AmazonS3Builder::default()
                     .with_url(url)
@@ -267,7 +284,7 @@ impl Client {
                 for (key, value) in map {
                     builder = builder.with_config(key.parse()?, value);
                 }
-                Arc::new(builder.build()?)
+                (Arc::new(builder.build()?), None, None)
             }
             "az" | "azure" => {
                 let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
@@ -276,17 +293,38 @@ impl Client {
                 for (key, value) in map {
                     builder = builder.with_config(key.parse()?, value);
                 }
-                Arc::new(builder.build()?)
+                (Arc::new(builder.build()?), None, None)
+            }
+            "snowflake" => {
+                let (store, crypto_mp, stage_prefix) = build_store_for_snowflake_stage(map, retry_config.clone()).await?;
+
+                (store, crypto_mp, Some(stage_prefix))
             }
             _ => unimplemented!("unknown url scheme")
         };
 
+        let prefix = match (store_prefix, user_prefix) {
+            (Some(s), Some(u)) if s.ends_with("/") => Some(format!("{s}{u}")),
+            (Some(s), Some(u)) => Some(format!("{s}/{u}")),
+            (s, u) => s.or(u)
+        };
+
         Ok(Client {
             store,
+            crypto_material_provider,
             config: Config {
+                prefix,
                 retry_config
             }
         })
+    }
+
+    fn full_path(&self, path: &Path) -> Path {
+        if let Some(prefix) = self.config.prefix.as_ref() {
+            unsafe { string_to_path(format!("{prefix}{path}")) }
+        } else {
+            path.clone()
+        }
     }
 }
 
@@ -357,7 +395,7 @@ macro_rules! ensure_client {
                 client
             },
             Err(e) => {
-                tracing::warn!("{}", e);
+                tracing::warn!("{}", crate::error::format_err(&e));
                 $response.into_error(e);
                 continue;
             }

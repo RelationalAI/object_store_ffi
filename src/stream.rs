@@ -1,4 +1,5 @@
-use crate::{destroy_with_runtime, static_config, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
+use crate::encryption::{CrypterReader, CrypterWriter, Mode};
+use crate::{destroy_with_runtime, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
 use crate::util::{size_to_ranges, Compression, CompressedWriter, with_decoder, cstr_to_path};
 use crate::error::RetryState;
 use crate::with_cancellation;
@@ -7,78 +8,99 @@ use object_store::{path::Path, ObjectStore};
 
 use bytes::Buf;
 use tokio_util::io::StreamReader;
-use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncBufReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use std::ffi::{c_char, c_void, c_longlong};
 use futures_util::{StreamExt, TryStreamExt};
 
-pub(crate) async fn handle_get_stream(client: Client, path: &Path, size_hint: usize, compression: Compression) -> anyhow::Result<(Box<ReadStream>, usize)> {
-    if size_hint > 0 && size_hint < static_config().multipart_get_threshold as usize {
-        // Perform a single get without the head request
-        let result = client.store.get(path).await?;
-        let full_size = result.meta.size;
-        let stream = result.into_stream().map_err(Into::<std::io::Error>::into).boxed();
-        let reader = StreamReader::new(stream);
-        let decoded = with_decoder(compression, reader);
-        return Ok((Box::new(ReadStream { reader: tokio::io::BufReader::with_capacity(64 * 1024, decoded) }), full_size));
-    } else {
-        // Perform head request and prefetch parts in parallel
-        let meta = client.store.head(&path).await?;
-        let part_ranges = size_to_ranges(meta.size);
+pub(crate) async fn handle_get_stream(client: Client, path: &Path, _size_hint: usize, compression: Compression) -> anyhow::Result<(Box<ReadStream>, usize)> {
+    let path = &client.full_path(path);
+    let result = client.store.get_opts(
+        &path,
+        object_store::GetOptions {
+            head: true,
+            ..Default::default()
+        }
+    ).await?;
+    // Perform head request and prefetch parts in parallel
+    let part_ranges = size_to_ranges(result.meta.size);
 
-        let state = (
-            client,
-            path.clone()
-        );
-        let stream = futures_util::stream::iter(part_ranges)
-            .scan(state, |state, range| {
-                let state = state.clone();
-                async move { Some((state, range)) }
-            })
-            .map(|((client, path), range)| async move {
-                return tokio::spawn(async move {
-                    let mut retry_state = RetryState::new(client.config.retry_config);
-                    'retry: loop {
-                        match client.store.get_range(&path, range.clone()).await.map_err(Into::into) {
-                            Ok(bytes) => {
-                                return Ok::<_, anyhow::Error>(bytes)
-                            },
-                            Err(e) => {
-                                match retry_state.should_retry(&e) {
-                                    Ok((info, duration)) => {
-                                        tracing::info!("retrying get stream error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
-                                        tokio::time::sleep(duration).await;
-                                        continue 'retry;
-                                    }
-                                    Err(report) => {
-                                        tracing::warn!("[get stream] {}", report);
-                                        return Err(e);
-                                    }
+    let state = (
+        client.clone(),
+        path.clone()
+    );
+    let stream = futures_util::stream::iter(part_ranges)
+        .scan(state, |state, range| {
+            let state = state.clone();
+            async move { Some((state, range)) }
+        })
+        .map(|((client, path), range)| async move {
+            return tokio::spawn(async move {
+                let mut retry_state = RetryState::new(client.config.retry_config);
+                'retry: loop {
+                    match client.store.get_range(&path, range.clone()).await.map_err(Into::into) {
+                        Ok(bytes) => {
+                            return Ok::<_, anyhow::Error>(bytes)
+                        },
+                        Err(e) => {
+                            match retry_state.should_retry(&e) {
+                                Ok((info, duration)) => {
+                                    tracing::info!("retrying get stream error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
+                                    tokio::time::sleep(duration).await;
+                                    continue 'retry;
+                                }
+                                Err(report) => {
+                                    tracing::warn!("[get stream] {}", report);
+                                    return Err(e);
                                 }
                             }
                         }
                     }
-                }).await?;
-            })
-            .buffered(64)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            .boxed();
+                }
+            }).await?;
+        })
+        .buffered(64)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .boxed();
 
-        let reader = StreamReader::new(stream);
-        let decoded = with_decoder(compression, reader);
-        return Ok((Box::new(ReadStream { reader: tokio::io::BufReader::with_capacity(64 * 1024, decoded) }), meta.size));
-    }
+    let reader: Box<dyn AsyncBufRead + Send + Unpin> = if let Some(cryptmp) = client.crypto_material_provider.as_ref() {
+        let material = cryptmp.material_from_metadata(path.as_ref(), &result.attributes).await?;
+        let decrypter_reader = CrypterReader::new(StreamReader::new(stream), Mode::Decrypt, &material)?;
+        let buffer_reader = BufReader::with_capacity(64 * 1024, decrypter_reader);
+        Box::new(buffer_reader)
+    } else {
+        Box::new(StreamReader::new(stream))
+    };
+
+    let decoded = with_decoder(compression, reader);
+    return Ok((Box::new(ReadStream { reader: BufReader::with_capacity(64 * 1024, decoded) }), result.meta.size));
 }
 
 pub(crate) async fn handle_put_stream(client: Client, path: &Path, compression: Compression) -> anyhow::Result<Box<WriteStream>> {
-    let writer = object_store::buffered::BufWriter::with_capacity(
-        client.store,
-        path.clone(),
-        10 * 1024 * 1024
-    )
-        .with_max_concurrency(64);
+    let path = &client.full_path(path);
+    let writer: BoxedUpload = if let Some(cryptmp) = client.crypto_material_provider.as_ref() {
+        let (material, attrs) = cryptmp.material_for_write(path.as_ref(), None).await?;
+        let writer = object_store::buffered::BufWriter::with_capacity(
+            client.store,
+            path.clone(),
+            10 * 1024 * 1024
+        )
+            .with_attributes(attrs)
+            .with_max_concurrency(64);
+        let encrypter_writer = CrypterWriter::new(writer, Mode::Encrypt, &material)?;
+        Box::new(encrypter_writer)
+    } else {
+        Box::new(
+            object_store::buffered::BufWriter::with_capacity(
+                client.store,
+                path.clone(),
+                10 * 1024 * 1024
+            )
+            .with_max_concurrency(64)
+        )
+    };
 
     let encoded = CompressedWriter::new(compression, writer);
-    return Ok(Box::new(WriteStream { writer: encoded, aborted: false }));
+    return Ok(Box::new(WriteStream { writer: Box::new(encoded), aborted: false }));
 }
 
 #[repr(C)]
@@ -118,7 +140,7 @@ impl RawResponse for ReadResponse {
 }
 
 pub struct ReadStream {
-    reader: tokio::io::BufReader<Box<dyn AsyncRead + Unpin + Send>>
+    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>
 }
 
 #[no_mangle]
@@ -236,10 +258,16 @@ pub extern "C" fn read_from_stream(
                     let amount_to_read = size.min(amount);
                     let mut bytes_read = 0;
                     while amount_to_read > bytes_read {
+                        let len = slice.len();
                         let n = wrapper.reader.read_buf(&mut slice).await?;
 
                         if n == 0 {
-                            return Ok((bytes_read, true))
+                            if len == 0 {
+                                // cannot determine if it is eof
+                                return Ok((bytes_read, false))
+                            } else {
+                                return Ok((bytes_read, true))
+                            }
                         } else {
                             bytes_read += n;
                         }
@@ -355,7 +383,7 @@ impl RawResponse for WriteResponse {
 
 
 pub struct WriteStream {
-    writer: CompressedWriter<object_store::buffered::BufWriter>,
+    writer: BoxedUpload,
     aborted: bool
 }
 
