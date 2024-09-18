@@ -46,10 +46,16 @@ impl object_store::CredentialProvider for S3StageCredentialProvider {
             _ => {}
         }
 
+        // The session token is empty when testing against minio
+        let token = match info.stage_info.creds.aws_token.trim() {
+            "" => None,
+            token => Some(token.to_string())
+        };
+
         let creds = Arc::new(object_store::aws::AwsCredential {
             key_id: info.stage_info.creds.aws_key_id.clone(),
             secret_key: info.stage_info.creds.aws_secret_key.clone(),
-            token: Some(info.stage_info.creds.aws_token.clone())
+            token
         });
 
         *locked = Some(Arc::clone(&creds));
@@ -65,7 +71,7 @@ pub(crate) struct SnowflakeConfig {
     pub kms_config: Option<SnowflakeStageKmsConfig>
 }
 
-pub(crate) fn validate_config_for_snowflake(mut map: HashMap<String, String>, retry_config: RetryConfig) -> anyhow::Result<SnowflakeConfig> {
+pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, retry_config: RetryConfig) -> anyhow::Result<SnowflakeConfig> {
     let mut required_or_env = |field: &str| {
         map
             .remove(field)
@@ -78,9 +84,14 @@ pub(crate) fn validate_config_for_snowflake(mut map: HashMap<String, String>, re
     let client_config = SnowflakeClientConfig {
         account: required_or_env("snowflake_account")?,
         database: required_or_env("snowflake_database")?,
-        host: required_or_env("snowflake_host")?,
+        endpoint: required_or_env("snowflake_endpoint")
+            .or(required_or_env("snowflake_host").map(|h| format!("https://{h}")))?,
         schema: required_or_env("snowflake_schema")?,
         warehouse: map.remove("snowflake_warehouse").or(std::env::var("SNOWFLAKE_WAREHOUSE").ok()),
+        username: map.remove("snowflake_username").or(std::env::var("SNOWFLAKE_USERNAME").ok()),
+        password: map.remove("snowflake_password").or(std::env::var("SNOWFLAKE_PASSWORD").ok()),
+        role: map.remove("snowflake_role").or(std::env::var("SNOWFLAKE_ROLE").ok()),
+        master_token_path: map.remove("snowflake_master_token_path").or(std::env::var("MASTER_TOKEN_PATH").ok()),
         retry_config
     };
 
@@ -114,14 +125,16 @@ pub(crate) fn validate_config_for_snowflake(mut map: HashMap<String, String>, re
     };
 
     for (key, _value) in map {
-        return Err(Error::invalid_config(format!("Unknown config `{key}` found while validating snowflake config")).into());
+        if key.starts_with("snowflake") {
+            return Err(Error::invalid_config(format!("Unknown config `{key}` found while validating snowflake config")).into());
+        }
     }
 
     Ok(config)
 }
 
-pub(crate) async fn build_store_for_snowflake_stage(config_map: HashMap<String, String>, retry_config: RetryConfig) -> anyhow::Result<(Arc<dyn ObjectStore>, Option<Arc<dyn CryptoMaterialProvider>>, String)> {
-    let config = validate_config_for_snowflake(config_map, retry_config.clone())?;
+pub(crate) async fn build_store_for_snowflake_stage(mut config_map: HashMap<String, String>, retry_config: RetryConfig) -> anyhow::Result<(Arc<dyn ObjectStore>, Option<Arc<dyn CryptoMaterialProvider>>, String)> {
+    let config = validate_config_for_snowflake(&mut config_map, retry_config.clone())?;
     let client = SnowflakeClient::new(config.client_config);
     let info = client.current_upload_info(&config.stage).await?;
 
@@ -131,14 +144,41 @@ pub(crate) async fn build_store_for_snowflake_stage(config_map: HashMap<String, 
                 .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the bucket name"))?;
 
             let provider = S3StageCredentialProvider::new(&config.stage, client.clone());
-            let store = object_store::aws::AmazonS3Builder::default()
-                .with_region(info.stage_info.region.clone())
-                .with_bucket_name(bucket)
-                .with_credentials(Arc::new(provider))
-                .with_virtual_hosted_style_request(true)
-                .with_unsigned_payload(true)
-                .with_retry(retry_config)
-                .build()?;
+            let store = if let Some(test_endpoint) = info.stage_info.test_endpoint.as_deref() {
+                config_map.insert("allow_http".into(), "true".into());
+                let mut builder = object_store::aws::AmazonS3Builder::default()
+                    .with_region(info.stage_info.region.clone())
+                    .with_bucket_name(bucket)
+                    .with_credentials(Arc::new(provider))
+                    .with_virtual_hosted_style_request(false)
+                    .with_unsigned_payload(true)
+                    .with_retry(retry_config)
+                    .with_endpoint(test_endpoint);
+
+                    for (key, value) in config_map {
+                        builder = builder.with_config(key.parse()?, value);
+                    }
+
+                    builder.build()?
+            } else {
+                let mut builder = object_store::aws::AmazonS3Builder::default()
+                    .with_region(info.stage_info.region.clone())
+                    .with_bucket_name(bucket)
+                    .with_credentials(Arc::new(provider))
+                    .with_virtual_hosted_style_request(true)
+                    .with_unsigned_payload(true)
+                    .with_retry(retry_config);
+
+                if let Some(end_point) = info.stage_info.end_point.as_deref() {
+                    builder = builder.with_endpoint(format!("https://{bucket}.{end_point}"));
+                }
+
+                for (key, value) in config_map {
+                    builder = builder.with_config(key.parse()?, value);
+                }
+
+                builder.build()?
+            };
 
             if config.kms_config.is_some() && !info.stage_info.is_client_side_encrypted {
                 return Err(Error::StorageNotEncrypted(config.stage.clone()).into());

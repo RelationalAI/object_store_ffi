@@ -479,9 +479,20 @@ impl<R: AsyncRead> AsyncRead for CrypterReader<R> {
         loop {
             *this.state = match this.state {
                 State::Initial => {
-                    let mut buf = ReadBuf::new(this.inbuf.unfilled_mut());
-                    ready!(this.reader.as_mut().poll_read(cx, &mut buf))?;
-                    let amt = buf.filled().len();
+                    let mut wrapped = ReadBuf::new(this.inbuf.unfilled_mut());
+                    match this.reader.as_mut().poll_read(cx, &mut wrapped) {
+                        Poll::Ready(res) => res?,
+                        Poll::Pending => {
+                            if buf.filled().len() > 0 {
+                                // There is pending data in buf return Ready instead of Pending
+                                return Poll::Ready(Ok(()));
+                            } else {
+                                // We need to wait
+                                return Poll::Pending;
+                            }
+                        }
+                    }
+                    let amt = wrapped.filled().len();
                     this.inbuf.advance(amt);
                     if amt == 0 {
                         // never crypted anything, go to State::Done without flushing
@@ -498,9 +509,20 @@ impl<R: AsyncRead> AsyncRead for CrypterReader<R> {
                         this.inbuf.compact();
                     }
                     if this.inbuf.unfilled().len() > 0 {
-                        let mut buf = ReadBuf::new(this.inbuf.unfilled_mut());
-                        ready!(this.reader.as_mut().poll_read(cx, &mut buf))?;
-                        let amt = buf.filled().len();
+                        let mut wrapped = ReadBuf::new(this.inbuf.unfilled_mut());
+                        match this.reader.as_mut().poll_read(cx, &mut wrapped) {
+                            Poll::Ready(res) => res?,
+                            Poll::Pending => {
+                                if buf.filled().len() > 0 {
+                                    // There is pending data in buf return Ready instead of Pending
+                                    return Poll::Ready(Ok(()));
+                                } else {
+                                    // We need to wait
+                                    return Poll::Pending;
+                                }
+                            }
+                        }
+                        let amt = wrapped.filled().len();
                         this.inbuf.advance(amt);
                         if amt == 0 {
                             // reached reader eof

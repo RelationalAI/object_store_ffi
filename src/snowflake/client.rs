@@ -92,7 +92,10 @@ pub(crate) struct SnowflakeStageInfo {
     pub ciphers: Option<String>,
     pub creds: SnowflakeStageCreds,
     pub use_s3_regional_url: bool,
-    pub end_point: Option<String>
+    pub end_point: Option<String>,
+    // This field is not part of the gateway API
+    // it is only used for testing purposes
+    pub test_endpoint: Option<String>
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,9 +186,13 @@ struct SnowflakeStatusResponse {
 pub(crate) struct SnowflakeClientConfig {
     pub account: String,
     pub database: String,
-    pub host: String,
+    pub endpoint: String,
     pub schema: String,
     pub warehouse: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub role: Option<String>,
+    pub master_token_path: Option<String>,
     pub retry_config: RetryConfig
 }
 
@@ -196,9 +203,14 @@ impl SnowflakeClientConfig {
         Ok(SnowflakeClientConfig {
             account: env::var("SNOWFLAKE_ACCOUNT")?,
             database: env::var("SNOWFLAKE_DATABASE")?,
-            host: env::var("SNOWFLAKE_HOST")?,
+            endpoint: env::var("SNOWFLAKE_ENDPOINT")
+                .or(env::var("SNOWFLAKE_HOST").map(|h| format!("https://{h}")))?,
             schema: env::var("SNOWFLAKE_SCHEMA")?,
             warehouse: env::var("SNOWFLAKE_WAREHOUSE").ok(),
+            username: env::var("SNOWFLAKE_USERNAME").ok(),
+            password: env::var("SNOWFLAKE_PASSWORD").ok(),
+            role: env::var("SNOWFLAKE_ROLE").ok(),
+            master_token_path: env::var("MASTER_TOKEN_PATH").ok(),
             retry_config: RetryConfig::default()
         })
     }
@@ -285,7 +297,7 @@ impl SnowflakeClient {
             }
         };
 
-        let response = self.client.post(format!("https://{}/session/heartbeat", self.config.host))
+        let response = self.client.post(format!("{}/session/heartbeat", self.config.endpoint))
             .header("Authorization", format!("Snowflake Token=\"{}\"", token))
             .send()
             .await?;
@@ -307,7 +319,7 @@ impl SnowflakeClient {
 
         if let Some(TokenState { token, master_token, .. }) = locked.as_ref() {
             // Renew
-            let response = self.client.post(format!("https://{}/session/token-request", config.host))
+            let response = self.client.post(format!("{}/session/token-request", config.endpoint))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .header("Authorization", format!("Snowflake Token=\"{}\"", master_token))
@@ -351,33 +363,70 @@ impl SnowflakeClient {
                 }
             }
         } else {
-            // Login
-            let master_token = std::fs::read_to_string(std::env::var("MASTER_TOKEN_PATH").unwrap_or("/snowflake/session/token".into()))
-                .map_err(Error::invalid_config_err("Unable to access master token file"))?;
+            let response = if let (Some(username), Some(password)) = (&config.username, &config.password) {
+                // User Password Login
+                let mut qs = vec![
+                    ("accountName", &config.account),
+                    ("databaseName", &config.database),
+                    ("schemaName", &config.schema),
+                ];
 
-            let mut qs = vec![
-                ("accountName", &config.account),
-                ("databaseName", &config.database),
-                ("schemaName", &config.schema),
-            ];
+                if let Some(warehouse) = config.warehouse.as_ref() {
+                    qs.push(("warehouse", warehouse));
+                }
 
-            if let Some(warehouse) = config.warehouse.as_ref() {
-                qs.push(("warehouse", warehouse));
-            }
+                if let Some(role) = config.role.as_ref() {
+                    qs.push(("roleName", role));
+                }
 
-            let response = self.client.post(format!("https://{}/session/v1/login-request", config.host))
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/snowflake")
-                .query(&qs)
-                .json(&serde_json::json!({
-                    "data": {
-                        "ACCOUNT_NAME": &config.account,
-                        "TOKEN": &master_token,
-                        "AUTHENTICATOR": "OAUTH"
-                    }
-                }))
-                .send()
-                .await?;
+                let response = self.client.post(format!("{}/session/v1/login-request", config.endpoint))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/snowflake")
+                    .query(&qs)
+                    .json(&serde_json::json!({
+                        "data": {
+                            "PASSWORD": password,
+                            "LOGIN_NAME": username,
+                            "ACCOUNT_NAME": &config.account,
+                            "AUTHENTICATOR": "USERNAME_PASSWORD_MFA"
+                        }
+                    }))
+                    .send()
+                    .await?;
+
+                response
+            } else {
+                // Master Token Login
+                let master_token = std::fs::read_to_string(config.master_token_path.as_deref().unwrap_or("/snowflake/session/token"))
+                    .map_err(Error::invalid_config_err("Unable to access master token file"))?;
+
+
+                let mut qs = vec![
+                    ("accountName", &config.account),
+                    ("databaseName", &config.database),
+                    ("schemaName", &config.schema),
+                ];
+
+                if let Some(warehouse) = config.warehouse.as_ref() {
+                    qs.push(("warehouse", warehouse));
+                }
+
+                let response = self.client.post(format!("{}/session/v1/login-request", config.endpoint))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/snowflake")
+                    .query(&qs)
+                    .json(&serde_json::json!({
+                        "data": {
+                            "ACCOUNT_NAME": &config.account,
+                            "TOKEN": &master_token,
+                            "AUTHENTICATOR": "OAUTH"
+                        }
+                    }))
+                    .send()
+                    .await?;
+
+                response
+            };
 
             response.error_for_status_ref()?;
 
@@ -409,7 +458,7 @@ impl SnowflakeClient {
     async fn query_impl<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> crate::Result<SnowflakeResponse<T>> {
         let token = self.token().await?;
         let config = &self.config;
-        let response = self.client.post(format!("https://{}/queries/v1/query-request", config.host))
+        let response = self.client.post(format!("{}/queries/v1/query-request", config.endpoint))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("Authorization", format!("Snowflake Token=\"{}\"", token))
@@ -429,7 +478,6 @@ impl SnowflakeClient {
 
         response.error_for_status_ref()?;
 
-        // TODO: directly to Deserialize
         let response_string = response
             .text()
             .await?;

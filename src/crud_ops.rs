@@ -43,7 +43,7 @@ impl RawResponse for Response {
     }
 }
 
-async fn read_to_slice(reader: &mut Box<dyn AsyncRead + Send + Unpin>, mut slice: &mut [u8]) -> anyhow::Result<usize> {
+async fn read_to_slice(reader: &mut BoxedReader, mut slice: &mut [u8]) -> anyhow::Result<usize> {
     let mut received_bytes = 0;
     loop {
         match reader.read_buf(&mut slice).await {
@@ -169,7 +169,12 @@ pub(crate) async fn handle_put(client: Client, slice: &'static [u8], path: &Path
     if len < static_config().multipart_put_threshold as usize {
         if let Some(cryptmp) = client.crypto_material_provider.as_ref() {
             let (material, attrs) = cryptmp.material_for_write(path.as_ref(), Some(slice.len())).await?;
-            let ciphertext = encrypt(&slice, &material).unwrap();
+            let ciphertext = if slice.is_empty() {
+                // Do not write any padding if there was no data
+                vec![]
+            } else {
+                encrypt(&slice, &material)?
+            };
             let _ = client.store.put_opts(
                 path,
                 ciphertext.into(),
