@@ -149,7 +149,6 @@ impl CryptoMaterialProvider for SnowflakeStageKms {
                 .ok_or_else(|| "src locations and encryption material length mismatch")?
                 .ok_or_else(|| "path not encrypted")?;
 
-            println!("enc_material {:?}", encryption_material);
             let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
                 .map_err(|e| format!("failed to decode qsmk base64: {}", e))?;
             Ok::<_, ErrorMessage>(master_key)
