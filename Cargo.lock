@@ -1198,7 +1198,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.10.2"
-source = "git+https://github.com/andrebsguedes/arrow-rs.git?branch=unsigned-payload-and-azure-list-offset#dd905b9c5c975eb27c78a4a091d1cb2de8773404"
+source = "git+https://github.com/andrebsguedes/arrow-rs.git?branch=unsigned-payload-and-azure-list-offset#5f3bf4e235194ab818e67d2a69e6695970af5b63"
 dependencies = [
  "async-trait",
  "base64",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "object_store_ffi"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-channel",

@@ -1,6 +1,6 @@
 [package]
 name = "object_store_ffi"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 
 [[bench]]
@@ -34,7 +34,7 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "hickory-dns"] }
 # object_store = { version = "0.10.1", features = ["azure", "aws"] }
 # Pinned to a specific commit while waiting for upstream
-object_store = { git = "https://github.com/andrebsguedes/arrow-rs.git", branch = "unsigned-payload-and-azure-list-offset", features = ["azure", "aws", "experimental-azure-list-offset"] }
+object_store = { git = "https://github.com/andrebsguedes/arrow-rs.git", branch = "unsigned-payload-and-azure-list-offset", features = ["azure", "aws", "experimental-azure-list-offset", "experimental-arbitrary-list-prefix"] }
 thiserror = "1"
 anyhow = { version = "1", features = ["backtrace"] }
 once_cell = "1.18"
