@@ -15,6 +15,7 @@ use anyhow::anyhow;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
+use std::any::Any;
 
 use object_store::{path::Path, ObjectStore};
 
@@ -82,6 +83,29 @@ fn result_cb(handle: *const c_void) -> i32 {
 
 type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 type BoxedUpload = Box<dyn AsyncUpload + Send + Unpin>;
+
+// TODO Use this in the future if we really need to downcast to
+// a concrete store. Currently we are using ClientContext for
+// this
+//
+// pub(crate) trait ObjectStoreAny: ObjectStore {
+//     fn as_any(&self) -> &dyn Any;
+//     fn as_dyn_store<'a>(self: Arc<Self>) -> Arc<dyn ObjectStore + 'a>
+//     where
+//         Self: 'a;
+// }
+//
+//
+// impl <T: ObjectStore + Sized> ObjectStoreAny for T {
+//     fn as_any(&self) -> &dyn Any {
+//         self
+//     }
+//     fn as_dyn_store<'a>(self: Arc<Self>) -> Arc<dyn ObjectStore + 'a>
+//         where
+//             Self: 'a {
+//         self
+//     }
+// }
 
 // The result type used for the API functions exposed to Julia. This is used for both
 // synchronous errors, e.g. our dispatch channel is full, and for async errors such
@@ -233,11 +257,29 @@ struct Config {
     retry_config: RetryConfig
 }
 
+#[async_trait::async_trait]
+pub(crate) trait Extension: std::fmt::Debug + Send + Sync + 'static {
+    #[allow(dead_code)]
+    fn as_any(&self) -> &dyn Any;
+    async fn current_stage_info(&self) -> anyhow::Result<String> {
+        return Err(anyhow!("current_stage_info is not implemented"));
+    }
+}
+
+impl Extension for () {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+type ClientExtension = Arc<dyn Extension>;
+
 #[derive(Debug, Clone)]
 pub struct Client {
     store: Arc<dyn ObjectStore>,
     crypto_material_provider: Option<Arc<dyn CryptoMaterialProvider>>,
-    config: Config
+    config: Config,
+    extension: ClientExtension
 }
 
 impl Client {
@@ -274,9 +316,7 @@ impl Client {
 
         let user_prefix = map.remove("prefix");
 
-        type StoreTuple = (Arc<dyn ObjectStore>, Option<Arc<dyn CryptoMaterialProvider>>, Option<String>);
-
-        let (store, crypto_material_provider, store_prefix): StoreTuple = match url.scheme() {
+        let client = match url.scheme() {
             "s3" => {
                 let mut builder = object_store::aws::AmazonS3Builder::default()
                     .with_url(url)
@@ -284,7 +324,16 @@ impl Client {
                 for (key, value) in map {
                     builder = builder.with_config(key.parse()?, value);
                 }
-                (Arc::new(builder.build()?), None, None)
+
+                Client {
+                    store: Arc::new(builder.build()?),
+                    crypto_material_provider: None,
+                    config: Config {
+                        prefix: user_prefix,
+                        retry_config
+                    },
+                    extension: Arc::new(()),
+                }
             }
             "az" | "azure" => {
                 let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
@@ -293,35 +342,53 @@ impl Client {
                 for (key, value) in map {
                     builder = builder.with_config(key.parse()?, value);
                 }
-                (Arc::new(builder.build()?), None, None)
+
+                Client {
+                    store: Arc::new(builder.build()?),
+                    crypto_material_provider: None,
+                    config: Config {
+                        prefix: user_prefix,
+                        retry_config
+                    },
+                    extension: Arc::new(())
+                }
             }
             "snowflake" => {
-                let (store, crypto_mp, stage_prefix) = build_store_for_snowflake_stage(map, retry_config.clone()).await?;
+                let (store, crypto_material_provider, stage_prefix, extension) = build_store_for_snowflake_stage(map, retry_config.clone()).await?;
 
-                (store, crypto_mp, Some(stage_prefix))
+                let prefix = match (stage_prefix, user_prefix) {
+                    (s, Some(u)) if s.ends_with("/") => Some(format!("{s}{u}")),
+                    (s, Some(u)) => Some(format!("{s}/{u}")),
+                    (s, None) => Some(s)
+                };
+
+                Client {
+                    store,
+                    crypto_material_provider,
+                    config: Config {
+                        prefix,
+                        retry_config
+                    },
+                    extension
+                }
             }
             _ => unimplemented!("unknown url scheme")
         };
 
-        let prefix = match (store_prefix, user_prefix) {
-            (Some(s), Some(u)) if s.ends_with("/") => Some(format!("{s}{u}")),
-            (Some(s), Some(u)) => Some(format!("{s}/{u}")),
-            (s, u) => s.or(u)
-        };
-
-        Ok(Client {
-            store,
-            crypto_material_provider,
-            config: Config {
-                prefix,
-                retry_config
-            }
-        })
+        Ok(client)
     }
 
     fn full_path(&self, path: &Path) -> Path {
         if let Some(prefix) = self.config.prefix.as_ref() {
-            unsafe { string_to_path(format!("{prefix}{path}")) }
+            // FIXME We should always prepend the path as this inner check prevents
+            // intentionally duplicating the prefix.
+            // We don't do it because currently some other code may still pass
+            // the prefix and we don't want to apply it twice.
+            if path.as_ref().starts_with(prefix) {
+                path.clone()
+            } else {
+                unsafe { string_to_path(format!("{prefix}{path}")) }
+            }
         } else {
             path.clone()
         }

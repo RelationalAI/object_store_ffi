@@ -1,16 +1,42 @@
-use crate::{encryption::{CryptoMaterialProvider, CryptoScheme}, error::Error};
+use crate::{clients, encryption::{CryptoMaterialProvider, CryptoScheme}, error::Error, CResult, Client, ClientExtension, Context, Extension, NotifyGuard, RawConfig, RawResponse, ResponseGuard};
+use crate::{RT, with_cancellation};
 
 pub(crate) mod client;
-use client::{SnowflakeClient, SnowflakeClientConfig};
+use anyhow::anyhow;
+use client::{NormalizedStageInfo, SnowflakeClient, SnowflakeClientConfig};
 
 pub(crate) mod kms;
 use kms::{SnowflakeStageKms, SnowflakeStageKmsConfig};
 
-use object_store::{ObjectStore, RetryConfig};
+use object_store::{RetryConfig, ObjectStore};
 use tokio::sync::Mutex;
 use std::sync::Arc;
 
 use std::collections::HashMap;
+use std::ffi::{CString, c_char, c_void};
+
+#[derive(Debug)]
+pub(crate) struct SnowflakeS3Extension {
+    stage: String,
+    client: Arc<SnowflakeClient>
+}
+
+#[async_trait::async_trait]
+impl Extension for SnowflakeS3Extension {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn current_stage_info(&self) -> anyhow::Result<String> {
+        let stage_info = &self
+            .client
+            .current_upload_info(&self.stage)
+            .await?
+            .stage_info;
+        let stage_info: NormalizedStageInfo = stage_info.try_into()?;
+        let string = serde_json::to_string(&stage_info)?;
+        Ok(string)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct S3StageCredentialProvider {
@@ -61,6 +87,71 @@ impl object_store::CredentialProvider for S3StageCredentialProvider {
         *locked = Some(Arc::clone(&creds));
 
         Ok(creds)
+    }
+}
+
+
+#[repr(C)]
+pub struct StageInfoResponse {
+    result: CResult,
+    stage_info: *mut c_char,
+    error_message: *mut c_char,
+    context: *const Context
+}
+
+unsafe impl Send for StageInfoResponse {}
+
+impl RawResponse for StageInfoResponse {
+    type Payload = String;
+    fn result_mut(&mut self) -> &mut CResult {
+        &mut self.result
+    }
+    fn context_mut(&mut self) -> &mut *const Context {
+        &mut self.context
+    }
+    fn error_message_mut(&mut self) -> &mut *mut c_char {
+        &mut self.error_message
+    }
+    fn set_payload(&mut self, payload: Option<Self::Payload>) {
+        match payload {
+            Some(serialized_info) => {
+                let c_string = CString::new(serialized_info).expect("should not have nulls");
+                self.stage_info = c_string.into_raw();
+            }
+            None => {
+                self.stage_info = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn current_stage_info(
+    config: *const RawConfig,
+    response: *mut StageInfoResponse,
+    handle: *const c_void
+) -> CResult {
+    let response = unsafe { ResponseGuard::new(response, handle) };
+    let config = unsafe { & (*config) };
+
+    match RT.get() {
+        Some(runtime) => {
+            runtime.spawn(async move {
+                let info_op = async {
+                    let client = clients()
+                        .try_get_with(config.get_hash(), Client::from_raw_config(config)).await
+                        .map_err(|e| anyhow!(e))?;
+                    Ok::<_, anyhow::Error>(client.extension.current_stage_info().await?)
+                };
+
+                with_cancellation!(info_op, response);
+            });
+            CResult::Ok
+        }
+        None => {
+            response.into_error("object_store_ffi runtime not started (may be missing initialization)");
+            return CResult::Error;
+        }
     }
 }
 
@@ -133,7 +224,15 @@ pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, r
     Ok(config)
 }
 
-pub(crate) async fn build_store_for_snowflake_stage(mut config_map: HashMap<String, String>, retry_config: RetryConfig) -> anyhow::Result<(Arc<dyn ObjectStore>, Option<Arc<dyn CryptoMaterialProvider>>, String)> {
+pub(crate) async fn build_store_for_snowflake_stage(
+    mut config_map: HashMap<String, String>,
+    retry_config: RetryConfig
+) -> anyhow::Result<(
+    Arc<dyn ObjectStore>,
+    Option<Arc<dyn CryptoMaterialProvider>>,
+    String,
+    ClientExtension
+)> {
     let config = validate_config_for_snowflake(&mut config_map, retry_config.clone())?;
     let client = SnowflakeClient::new(config.client_config);
     let info = client.current_upload_info(&config.stage).await?;
@@ -186,13 +285,18 @@ pub(crate) async fn build_store_for_snowflake_stage(mut config_map: HashMap<Stri
 
             let crypto_material_provider = if info.stage_info.is_client_side_encrypted {
                 let kms_config = config.kms_config.unwrap_or_default();
-                let stage_kms = SnowflakeStageKms::new(client, &config.stage, stage_prefix, kms_config);
+                let stage_kms = SnowflakeStageKms::new(client.clone(), &config.stage, stage_prefix, kms_config);
                 Some::<Arc<dyn CryptoMaterialProvider>>(Arc::new(stage_kms))
             } else {
                 None
             };
 
-            Ok((Arc::new(store), crypto_material_provider, stage_prefix.to_string()))
+            let extension = Arc::new(SnowflakeS3Extension {
+                stage: config.stage.clone(),
+                client
+            });
+
+            Ok((Arc::new(store), crypto_material_provider, stage_prefix.to_string(), extension))
         }
         _ => {
             unimplemented!("unknown stage location type");

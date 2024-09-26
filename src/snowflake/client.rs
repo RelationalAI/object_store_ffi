@@ -99,6 +99,56 @@ pub(crate) struct SnowflakeStageInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "stage_type")]
+#[non_exhaustive]
+pub(crate) enum NormalizedStageInfo {
+    S3 {
+        bucket: String,
+        prefix: String,
+        region: String,
+        aws_key_id: String,
+        aws_secret_key: String,
+        aws_token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        end_point: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_endpoint: Option<String>,
+    },
+    BlobStorage {
+        storage_account: String,
+        container: String,
+        prefix: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        end_point: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_endpoint: Option<String>
+    }
+
+}
+
+impl TryFrom<&SnowflakeStageInfo> for NormalizedStageInfo {
+    type Error = crate::error::Error;
+    fn try_from(value: &SnowflakeStageInfo) -> Result<Self, Self::Error> {
+        if value.location_type == "S3" {
+            let (bucket, prefix) = value.location.split_once('/')
+                .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the bucket name"))?;
+            return Ok(NormalizedStageInfo::S3 {
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+                region: value.region.clone(),
+                aws_key_id: value.creds.aws_key_id.clone(),
+                aws_secret_key: value.creds.aws_secret_key.clone(),
+                aws_token: value.creds.aws_token.clone(),
+                end_point: value.end_point.clone(),
+                test_endpoint: value.test_endpoint.clone()
+            })
+        } else {
+            return Err(Error::not_implemented("Azure BlobStorage is not implemented"));
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(Clone)]
 pub(crate) struct SnowflakeEncryptionMaterial {
@@ -112,7 +162,6 @@ impl Drop for SnowflakeEncryptionMaterial {
         self.query_stage_master_key.zeroize();
     }
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
