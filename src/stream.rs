@@ -1,4 +1,4 @@
-use crate::{static_config, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
+use crate::{destroy_with_runtime, static_config, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
 use crate::util::{size_to_ranges, Compression, CompressedWriter, with_decoder, cstr_to_path};
 use crate::error::RetryState;
 use crate::with_cancellation;
@@ -125,22 +125,10 @@ pub struct ReadStream {
 pub extern "C" fn destroy_read_stream(
     stream: *mut ReadStream
 ) -> CResult {
-    // Destroying complex objects is safer to do within the runtime to guard
-    // against the case were the destructor needs to spawn a task
-    match RT.get() {
-        Some(runtime) => {
-            let handle = runtime.handle();
-            handle.block_on(async {
-                let boxed = unsafe { Box::from_raw(stream) };
-                drop(boxed);
-            });
-            CResult::Ok
-        }
-        None => {
-            tracing::error!("failed to destroy read stream, runtime not started");
-            CResult::Error
-        }
-    }
+    destroy_with_runtime!({
+        let boxed = unsafe { Box::from_raw(stream) };
+        drop(boxed);
+    })
 }
 
 #[repr(C)]
@@ -375,22 +363,10 @@ pub struct WriteStream {
 pub extern "C" fn destroy_write_stream(
     writer: *mut WriteStream
 ) -> CResult {
-    // Destroying complex objects is safer to do within the runtime to guard
-    // against the case were the destructor needs to spawn a task
-    match RT.get() {
-        Some(runtime) => {
-            let handle = runtime.handle();
-            handle.block_on(async {
-                let boxed = unsafe { Box::from_raw(writer) };
-                drop(boxed);
-            });
-            CResult::Ok
-        }
-        None => {
-            tracing::error!("failed to destroy write stream, runtime not started");
-            CResult::Error
-        }
-    }
+    destroy_with_runtime!({
+        let boxed = unsafe { Box::from_raw(writer) };
+        drop(boxed);
+    })
 }
 
 #[repr(C)]

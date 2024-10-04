@@ -431,6 +431,33 @@ macro_rules! with_cancellation {
     };
 }
 
+#[macro_export]
+macro_rules! destroy_with_runtime {
+    ($destroy: block) => {
+        // Destroying complex objects is safer to do within the runtime to guard
+        // against the case were the destructor needs to spawn a task
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Already within runtime, just destroy
+            $destroy
+
+            CResult::Ok
+        } else {
+            match crate::RT.get() {
+                Some(runtime) => {
+                    // Enter runtime then destroy
+                    let handle = runtime.handle();
+                    let _guard = handle.enter();
+                    $destroy
+                    CResult::Ok
+                }
+                None => {
+                    tracing::error!("failed to destroy object within runtime, runtime not started");
+                    CResult::Error
+                }
+            }
+        }
+    };
+}
 
 trait NotifyGuard {
     fn is_uninitialized(&mut self) -> bool;
@@ -629,7 +656,78 @@ pub extern "C" fn _trigger_panic() -> CResult {
     CResult::Error
 }
 
+// Only used to test destruction from Julia threads
+#[no_mangle]
+pub extern "C" fn _destroy_from_julia_thread() -> CResult {
+    destroy_with_runtime!({
+        // let's make sure we can spawn in here
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        });
+
+        assert!(tokio::runtime::Handle::try_current().is_ok());
+    })
+}
+
+// Only used to test destruction from Tokio threads
+// This MUST ONLY be called from a Julia thread as it will
+// enter the runtime.
+#[no_mangle]
+pub extern "C" fn _destroy_in_tokio_thread() -> CResult {
+    runtime().handle().block_on(async {
+        destroy_with_runtime!({
+            // let's make sure we can spawn in here
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            });
+
+            assert!(tokio::runtime::Handle::try_current().is_ok());
+        })
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn current_metrics() -> metrics::MetricsSnapshot {
     metrics::MetricsSnapshot::current()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destroy_with_runtime_test() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        RT.set(rt).unwrap();
+
+        runtime().handle().block_on(async {
+            let result = destroy_with_runtime!({
+                // let's make sure we can spawn in here
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                });
+
+                assert!(tokio::runtime::Handle::try_current().is_ok());
+            });
+
+            assert_eq!(CResult::Ok, result);
+
+            std::thread::spawn(|| {
+                let result = destroy_with_runtime!({
+                    // let's make sure we can spawn in here
+                    tokio::spawn(async {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    });
+
+                    assert!(tokio::runtime::Handle::try_current().is_ok());
+                });
+
+                assert_eq!(CResult::Ok, result);
+            }).join().unwrap();
+        });
+    }
 }
