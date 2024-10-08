@@ -28,7 +28,10 @@ impl Default for SnowflakeStageKmsConfig {
         SnowflakeStageKmsConfig {
             crypto_scheme: CryptoScheme::Aes128Cbc,
             keyring_capacity: 100_000,
-            keyring_ttl: std::time::Duration::from_secs(40 * 60)
+            // We keep the ttl at 10 minutes to preserve the SF TSS guarantee
+            // that data cannot be decrypted after this period if the customer
+            // revokes the customer key
+            keyring_ttl: std::time::Duration::from_secs(10 * 60)
         }
     }
 }
