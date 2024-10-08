@@ -1,44 +1,118 @@
-use crate::{destroy_with_runtime, util::cstr_to_path, with_cancellation, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
+use crate::{destroy_with_runtime, error::RetryState, export_queued_op, util::{cstr_to_path, string_to_path}, with_cancellation, with_retries, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
 
 use object_store::{path::Path, ObjectStore, ObjectMeta};
+use pin_project::{pin_project, pinned_drop};
 
 use std::ffi::{c_char, c_void, CString};
-use futures_util::{StreamExt, stream::BoxStream};
+use futures_util::{stream::BoxStream, Stream, StreamExt};
 use std::sync::Arc;
 
-pub(crate) async fn handle_list(client: Client, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<Vec<ObjectMeta>> {
-    let prefix = &client.full_path(prefix);
-    let stream = if let Some(offset) = offset {
-        let offset = &client.full_path(offset);
-        client.store.list_with_offset(Some(&prefix), offset)
-    } else {
-        client.store.list(Some(&prefix))
-    };
-
-    let entries: Vec<_> = stream.collect().await;
-    let entries = entries.into_iter().collect::<Result<Vec<_>, _>>()?;
-    Ok(entries)
+#[pin_project(PinnedDrop)]
+pub struct ListStream {
+    store_ptr: Option<*const dyn ObjectStore>,
+    #[pin]
+    stream: BoxStream<'static, Vec<Result<object_store::ObjectMeta, object_store::Error>>>
 }
 
-pub(crate) async fn handle_list_stream(client: Client, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<Box<StreamWrapper>> {
-    let prefix = &client.full_path(prefix);
-    let mut wrapper = Box::new(StreamWrapper {
-        client: client.store.clone(),
-        stream: None
-    });
+impl ListStream {
+    fn new(client: &Client, prefix: &Path, offset: Option<&Path>) -> ListStream {
+        let base_prefix = client.config.prefix.clone();
+        let store_ptr = Arc::into_raw(client.store.clone());
+        // Safety: we coerce this to 'static to generate a static BoxStream from it.
+        // We ensure the store will outlive the stream by manually dropping ListStream.
+        let store: &'static dyn ObjectStore = unsafe { &*store_ptr };
+        let stream = match (base_prefix, offset) {
+            (None, None) => {
+                store.list(Some(&prefix)).chunks(1000).boxed()
+            }
+            (None, Some(offset)) => {
+                store.list_with_offset(Some(&prefix), offset).chunks(1000).boxed()
+            }
+            (Some(base), Some(offset)) => {
+                store.list_with_offset(Some(&prefix), offset)
+                    // Strip internal prefixes
+                    .scan(base, |base, meta| {
+                        let meta = meta.map(|mut meta| {
+                            if let Some(str) = meta.location.as_ref().strip_prefix(&*base) {
+                                meta.location = unsafe { string_to_path(str.to_string()) };
+                                meta
+                            } else {
+                                meta
+                            }
+                        });
+                        async { Some(meta) }
+                    })
+                    .chunks(1000)
+                    .boxed()
+            }
+            (Some(base), None) => {
+                store.list(Some(&prefix))
+                    // Strip internal prefixes
+                    .scan(base, |base, meta| {
+                        let meta = meta.map(|mut meta| {
+                            if let Some(str) = meta.location.as_ref().strip_prefix(&*base) {
+                                meta.location = unsafe { string_to_path(str.to_string()) };
+                                meta
+                            } else {
+                                meta
+                            }
+                        });
+                        async { Some(meta) }
+                    })
+                    .chunks(1000)
+                    .boxed()
 
-    let stream = if let Some(offset) = offset {
-        let offset = &client.full_path(offset);
-        wrapper.client.list_with_offset(Some(&prefix), offset).chunks(1000).boxed()
-    } else {
-        wrapper.client.list(Some(&prefix)).chunks(1000).boxed()
-    };
-    // Safety: This is needed because the compiler cannot infer that the stream
-    // will outlive the client. We ensure this happens
-    // by droping the stream before droping the Arc on destroy_list_stream
-    wrapper.stream = Some(unsafe { std::mem::transmute(stream) });
+            }
+        };
 
-    Ok(wrapper)
+        ListStream {
+            store_ptr: Some(store_ptr),
+            stream
+        }
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for ListStream {
+    fn drop(mut self: std::pin::Pin<&mut Self>) {
+        let ptr = self.store_ptr.take().expect("cannot drop twice");
+        let arc = unsafe { Arc::from_raw(ptr) };
+        let dummy_stream = Box::pin(futures_util::stream::empty::<Vec<Result<object_store::ObjectMeta, object_store::Error>>>());
+        let stream = std::mem::replace(&mut self.stream, dummy_stream);
+        // Safety: Must drop the stream before the arc here
+        drop(stream);
+        drop(arc);
+    }
+}
+
+unsafe impl Send for ListStream {}
+
+impl Stream for ListStream {
+    type Item = Vec<Result<object_store::ObjectMeta, object_store::Error>>;
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        self.project().stream.poll_next(cx)
+    }
+}
+
+impl Client {
+    async fn list_impl(&self, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<Vec<ObjectMeta>> {
+        let stream = self.list_stream_impl(prefix, offset).await?;
+        let entries: Vec<_> = stream.collect().await;
+        let entries = entries.into_iter().flatten().collect::<Result<Vec<_>, _>>()?;
+        Ok(entries)
+    }
+    pub(crate) async fn list(&self, path: &Path, offset: Option<&Path>) -> anyhow::Result<Vec<ObjectMeta>> {
+        with_retries!(self, self.list_impl(path, offset).await)
+    }
+    async fn list_stream_impl(&self, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<ListStream> {
+        let prefix = &self.full_path(prefix);
+        let offset = offset.map(|o| self.full_path(o));
+
+        Ok(ListStream::new(&self, prefix, offset.as_ref()))
+    }
+    pub(crate) async fn list_stream(&self, path: &Path, offset: Option<&Path>) -> anyhow::Result<ListStream> {
+        with_retries!(self, self.list_stream_impl(path, offset).await)
+    }
 }
 
 // Any non-Copy fields of ListEntry must be properly destroyed on destroy_list_entries
@@ -146,58 +220,28 @@ impl From<object_store::ObjectMeta> for ListEntry {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn list(
-    prefix: *const c_char,
-    offset: *const c_char,
-    config: *const RawConfig,
-    response: *mut ListResponse,
-    handle: *const c_void
-) -> CResult {
-    let response = unsafe { ResponseGuard::new(response, handle) };
-    let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
-    let prefix = unsafe{ cstr_to_path(prefix) };
-    let offset = if offset.is_null() {
-        None
-    } else {
-        Some(unsafe { cstr_to_path(std::ffi::CStr::from_ptr(offset)) })
-    };
-    let config = unsafe { & (*config) };
-    match SQ.get() {
-        Some(sq) => {
-            match sq.try_send(Request::List(prefix, offset, config, response)) {
-                Ok(_) => CResult::Ok,
-                Err(flume::TrySendError::Full(Request::List(_, _, _, response))) => {
-                    response.into_error("object_store_ffi internal channel full, backoff");
-                    CResult::Backoff
-                }
-                Err(flume::TrySendError::Disconnected(Request::List(_, _, _, response))) => {
-                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-                    CResult::Error
-                }
-                _ => unreachable!("the response type must match")
-            }
-        }
-        None => {
-            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-            return CResult::Error;
-        }
-    }
-}
-
-pub struct StreamWrapper {
-    client: Arc<dyn ObjectStore>,
-    stream: Option<BoxStream<'static, Vec<Result<object_store::ObjectMeta, object_store::Error>>>>
-}
+export_queued_op!(
+    list,
+    ListResponse,
+    |config, response| {
+        let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
+        let prefix = unsafe{ cstr_to_path(prefix) };
+        let offset = if offset.is_null() {
+            None
+        } else {
+            Some(unsafe { cstr_to_path(std::ffi::CStr::from_ptr(offset)) })
+        };
+        Ok(Request::List(prefix, offset, config, response))
+    },
+    prefix: *const c_char, offset: *const c_char
+);
 
 #[no_mangle]
 pub extern "C" fn destroy_list_stream(
-    stream: *mut StreamWrapper
+    stream: *mut ListStream
 ) -> CResult {
     destroy_with_runtime!({
-        let mut boxed = unsafe { Box::from_raw(stream) };
-        // Safety: Must drop the stream before the client here
-        drop(boxed.stream.take());
+        let boxed = unsafe { Box::from_raw(stream) };
         drop(boxed);
     })
 }
@@ -205,7 +249,7 @@ pub extern "C" fn destroy_list_stream(
 #[repr(C)]
 pub struct ListStreamResponse {
     result: CResult,
-    stream: *mut StreamWrapper,
+    stream: *mut ListStream,
     error_message: *mut c_char,
     context: *const Context
 }
@@ -213,7 +257,7 @@ pub struct ListStreamResponse {
 unsafe impl Send for ListStreamResponse {}
 
 impl RawResponse for ListStreamResponse {
-    type Payload = Box<StreamWrapper>;
+    type Payload = ListStream;
     fn result_mut(&mut self) -> &mut CResult {
         &mut self.result
     }
@@ -226,7 +270,7 @@ impl RawResponse for ListStreamResponse {
     fn set_payload(&mut self, payload: Option<Self::Payload>) {
         match payload {
             Some(stream) => {
-                self.stream = Box::into_raw(stream);
+                self.stream = Box::into_raw(Box::new(stream));
             }
             None => {
                 self.stream = std::ptr::null_mut();
@@ -235,53 +279,30 @@ impl RawResponse for ListStreamResponse {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn list_stream(
-    prefix: *const c_char,
-    offset: *const c_char,
-    config: *const RawConfig,
-    response: *mut ListStreamResponse,
-    handle: *const c_void
-) -> CResult {
-    let response = unsafe { ResponseGuard::new(response, handle) };
-    let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
-    let prefix = unsafe{ cstr_to_path(prefix) };
-    let offset = if offset.is_null() {
-        None
-    } else {
-        Some(unsafe { cstr_to_path(std::ffi::CStr::from_ptr(offset)) })
-    };
-    let config = unsafe { & (*config) };
-    match SQ.get() {
-        Some(sq) => {
-            match sq.try_send(Request::ListStream(prefix, offset, config, response)) {
-                Ok(_) => CResult::Ok,
-                Err(flume::TrySendError::Full(Request::ListStream(_, _, _, response))) => {
-                    response.into_error("object_store_ffi internal channel full, backoff");
-                    CResult::Backoff
-                }
-                Err(flume::TrySendError::Disconnected(Request::ListStream(_, _, _, response))) => {
-                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-                    CResult::Error
-                }
-                _ => unreachable!("the response type must match")
-            }
-        }
-        None => {
-            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-            return CResult::Error;
-        }
-    }
-}
+export_queued_op!(
+    list_stream,
+    ListStreamResponse,
+    |config, response| {
+        let prefix = unsafe { std::ffi::CStr::from_ptr(prefix) };
+        let prefix = unsafe{ cstr_to_path(prefix) };
+        let offset = if offset.is_null() {
+            None
+        } else {
+            Some(unsafe { cstr_to_path(std::ffi::CStr::from_ptr(offset)) })
+        };
+        Ok(Request::ListStream(prefix, offset, config, response))
+    },
+    prefix: *const c_char, offset: *const c_char
+);
 
 #[no_mangle]
 pub extern "C" fn next_list_stream_chunk(
-    stream: *mut StreamWrapper,
+    stream: *mut ListStream,
     response: *mut ListResponse,
     handle: *const c_void
 ) -> CResult {
     let response = unsafe { ResponseGuard::new(response, handle) };
-    let wrapper = match unsafe { stream.as_mut() } {
+    let stream = match unsafe { stream.as_mut() } {
         Some(w) => w,
         None => {
             response.into_error("null stream pointer");
@@ -293,8 +314,7 @@ pub extern "C" fn next_list_stream_chunk(
         Some(runtime) => {
             runtime.spawn(async move {
                 let list_op = async {
-                    let stream_ref = wrapper.stream.as_mut().unwrap();
-                    let option = match stream_ref.next().await {
+                    let option = match stream.next().await {
                         Some(vec) => {
                             vec.into_iter().collect::<Result<Vec<_>, _>>()?
                         }
