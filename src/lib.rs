@@ -1,8 +1,10 @@
 #[global_allocator]
 static GLOBAL: metrics::InstrumentedAllocator = metrics::InstrumentedAllocator {};
 
+use encryption::CryptoMaterialProvider;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
+use tokio::io::AsyncRead;
 use tokio::runtime::Runtime;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use std::collections::HashMap;
@@ -13,28 +15,34 @@ use anyhow::anyhow;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
+use std::any::Any;
 
 use object_store::{path::Path, ObjectStore};
 
 use moka::future::Cache;
 
 mod util;
-use util::Compression;
+use util::{string_to_path, AsyncUpload, Compression};
 
 mod error;
-use error::RetryState;
+pub(crate) use error::Result;
 
 mod list;
-use list::{handle_list, handle_list_stream, ListResponse, ListStreamResponse};
+use list::{ListResponse, ListStreamResponse};
 
 mod crud_ops;
-use crud_ops::{handle_get, handle_put, handle_delete, Response};
+use crud_ops::Response;
 
 mod stream;
-use stream::{handle_get_stream, handle_put_stream, GetStreamResponse, PutStreamResponse};
+use stream::{GetStreamResponse, PutStreamResponse};
 
 mod metrics;
 pub use metrics::{InstrumentedAllocator, METRICS};
+
+mod snowflake;
+use snowflake::build_store_for_snowflake_stage;
+
+mod encryption;
 
 // Our global variables needed by our library at runtime. Note that we follow Rust's
 // safety rules here by making them immutable with write-exactly-once semantics using
@@ -71,6 +79,32 @@ fn static_config() -> &'static StaticConfig {
 fn result_cb(handle: *const c_void) -> i32 {
     unsafe { RESULT_CB.get().expect("no result callback")(handle) }
 }
+
+type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
+type BoxedUpload = Box<dyn AsyncUpload + Send + Unpin>;
+
+// TODO Use this in the future if we really need to downcast to
+// a concrete store. Currently we are using ClientContext for
+// this
+//
+// pub(crate) trait ObjectStoreAny: ObjectStore {
+//     fn as_any(&self) -> &dyn Any;
+//     fn as_dyn_store<'a>(self: Arc<Self>) -> Arc<dyn ObjectStore + 'a>
+//     where
+//         Self: 'a;
+// }
+//
+//
+// impl <T: ObjectStore + Sized> ObjectStoreAny for T {
+//     fn as_any(&self) -> &dyn Any {
+//         self
+//     }
+//     fn as_dyn_store<'a>(self: Arc<Self>) -> Arc<dyn ObjectStore + 'a>
+//         where
+//             Self: 'a {
+//         self
+//     }
+// }
 
 // The result type used for the API functions exposed to Julia. This is used for both
 // synchronous errors, e.g. our dispatch channel is full, and for async errors such
@@ -119,9 +153,9 @@ impl<T: RawResponse> ResponseGuard<T> {
         *response.context_mut() = Arc::into_raw(context.clone());
         ResponseGuard { response, context, handle }
     }
-    pub(crate) fn success(self, payload: T::Payload) {
+    pub(crate) fn success(self, payload: impl Into<T::Payload>) {
         *self.response.result_mut() = CResult::Ok;
-        self.response.set_payload(Some(payload));
+        self.response.set_payload(Some(payload.into()));
         *self.response.error_message_mut() = std::ptr::null_mut();
     }
 }
@@ -165,6 +199,42 @@ enum Request {
 }
 
 unsafe impl Send for Request {}
+
+impl Request {
+    fn cancelled(&self) -> WaitForCancellationFuture {
+        match self {
+            Request::Get( .. , response) => response.cancelled(),
+            Request::Put( .. , response) => response.cancelled(),
+            Request::Delete( .. , response) => response.cancelled(),
+            Request::List( .. , response) => response.cancelled(),
+            Request::ListStream( .. , response) => response.cancelled(),
+            Request::GetStream( .. , response) => response.cancelled(),
+            Request::PutStream( .. , response) => response.cancelled()
+        }
+    }
+    fn into_error(self, error: impl std::fmt::Display) where Self: Sized {
+        match self {
+            Request::Get( .. , response) => response.into_error(error),
+            Request::Put( .. , response) => response.into_error(error),
+            Request::Delete( .. , response) => response.into_error(error),
+            Request::List( .. , response) => response.into_error(error),
+            Request::ListStream( .. , response) => response.into_error(error),
+            Request::GetStream( .. , response) => response.into_error(error),
+            Request::PutStream( .. , response) => response.into_error(error)
+        }
+    }
+    fn raw_config(&self) -> &RawConfig {
+        match self {
+            Request::Get( .. , config, _response) => config,
+            Request::Put( .. , config, _response) => config,
+            Request::Delete( .. , config, _response) => config,
+            Request::List( .. , config, _response) => config,
+            Request::ListStream( .. , config, _response) => config,
+            Request::GetStream( .. , config, _response) => config,
+            Request::PutStream( .. , config, _response) => config
+        }
+    }
+}
 
 // We use `jl_adopt_thread` to ensure Rust can call into Julia when notifying
 // the Base.Event that is waiting for the Rust result.
@@ -218,22 +288,41 @@ impl RawConfig {
 
 #[derive(Debug, Clone)]
 struct Config {
+    prefix: Option<String>,
     retry_config: RetryConfig
 }
+
+#[async_trait::async_trait]
+pub(crate) trait Extension: std::fmt::Debug + Send + Sync + 'static {
+    #[allow(dead_code)]
+    fn as_any(&self) -> &dyn Any;
+    async fn current_stage_info(&self) -> anyhow::Result<String> {
+        return Err(anyhow!("current_stage_info is not implemented"));
+    }
+}
+
+impl Extension for () {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+type ClientExtension = Arc<dyn Extension>;
 
 #[derive(Debug, Clone)]
 pub struct Client {
     store: Arc<dyn ObjectStore>,
-    config: Config
+    crypto_material_provider: Option<Arc<dyn CryptoMaterialProvider>>,
+    config: Config,
+    extension: ClientExtension
 }
 
 impl Client {
-    // Caution: This function is not retried as it does not perform any network
-    // operations currently. If this invariant no longer holds retries must be
-    // added here
+    // Caution: This function is not retried, retries must be handled internally.
     async fn from_raw_config(config: &RawConfig) -> anyhow::Result<Client> {
-        let mut map = config.as_map()?;
-
+        Ok(Client::from_config_map(config.as_map()?).await?)
+    }
+    async fn from_config_map(mut map: HashMap<String, String>) -> anyhow::Result<Client> {
         let url = map.remove("url")
             .ok_or(anyhow!("config object must have a key named 'url'"))?;
 
@@ -259,7 +348,9 @@ impl Client {
 
         let retry_config = parse_retry_config(&mut map)?;
 
-        let store: Arc<dyn ObjectStore> = match url.scheme() {
+        let user_prefix = map.remove("prefix");
+
+        let client = match url.scheme() {
             "s3" => {
                 let mut builder = object_store::aws::AmazonS3Builder::default()
                     .with_url(url)
@@ -267,7 +358,16 @@ impl Client {
                 for (key, value) in map {
                     builder = builder.with_config(key.parse()?, value);
                 }
-                Arc::new(builder.build()?)
+
+                Client {
+                    store: Arc::new(builder.build()?),
+                    crypto_material_provider: None,
+                    config: Config {
+                        prefix: user_prefix,
+                        retry_config
+                    },
+                    extension: Arc::new(()),
+                }
             }
             "az" | "azure" => {
                 let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
@@ -276,17 +376,56 @@ impl Client {
                 for (key, value) in map {
                     builder = builder.with_config(key.parse()?, value);
                 }
-                Arc::new(builder.build()?)
+
+                Client {
+                    store: Arc::new(builder.build()?),
+                    crypto_material_provider: None,
+                    config: Config {
+                        prefix: user_prefix,
+                        retry_config
+                    },
+                    extension: Arc::new(())
+                }
+            }
+            "snowflake" => {
+                let (store, crypto_material_provider, stage_prefix, extension) = build_store_for_snowflake_stage(map, retry_config.clone()).await?;
+
+                let prefix = match (stage_prefix, user_prefix) {
+                    (s, Some(u)) if s.ends_with("/") => Some(format!("{s}{u}")),
+                    (s, Some(u)) => Some(format!("{s}/{u}")),
+                    (s, None) => Some(s)
+                };
+
+                Client {
+                    store,
+                    crypto_material_provider,
+                    config: Config {
+                        prefix,
+                        retry_config
+                    },
+                    extension
+                }
             }
             _ => unimplemented!("unknown url scheme")
         };
 
-        Ok(Client {
-            store,
-            config: Config {
-                retry_config
+        Ok(client)
+    }
+
+    fn full_path(&self, path: &Path) -> Path {
+        if let Some(prefix) = self.config.prefix.as_ref() {
+            // FIXME We should always prepend the path as this inner check prevents
+            // intentionally duplicating the prefix.
+            // We don't do it because currently some other code may still pass
+            // the prefix and we don't want to apply it twice.
+            if path.as_ref().starts_with(prefix) {
+                path.clone()
+            } else {
+                unsafe { string_to_path(format!("{prefix}{path}")) }
             }
-        })
+        } else {
+            path.clone()
+        }
     }
 }
 
@@ -347,70 +486,38 @@ impl Default for StaticConfig {
     }
 }
 
-macro_rules! ensure_client {
-    ($response: expr, $config: expr) => {
-        match clients()
-            .try_get_with($config.get_hash(), Client::from_raw_config($config)).await
-            .map_err(|e| anyhow!(e))
-        {
-            Ok(client) => {
-                client
-            },
-            Err(e) => {
-                tracing::warn!("{}", e);
-                $response.into_error(e);
-                continue;
-            }
-        }
-    };
-}
-
-macro_rules! with_retries_and_cancellation {
-    ($client:expr, $response:expr, $op: expr) => {
-        with_retries_and_cancellation!($client, $response, $op, true)
-    };
-    ($client:expr, $response:expr, $op: expr, $emit_warn: expr) => {
-        let mut retry_state = RetryState::new($client.config.retry_config.clone());
+#[macro_export]
+macro_rules! with_retries {
+    ($this:expr, $op: expr) => {{
+        let mut retry_state = RetryState::new($this.config.retry_config.clone());
         'retry: loop {
-            $response.ensure_active();
-            tokio::select! {
-                _ = $response.cancelled() => {
-                    tracing::warn!("operation was cancelled");
-                    $response.into_error("operation was cancelled");
-                    break 'retry;
-                }
-                res = $op => {
-                    match res {
-                        Ok(v) => {
-                            $response.success(v);
-                            break 'retry;
+            match $op {
+                Err(e) => {
+                    match retry_state.should_retry(&e) {
+                        Ok((info, duration)) => {
+                            tracing::info!("retrying error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
+                            tokio::time::sleep(duration).await;
+                            continue 'retry;
                         }
-                        Err(e) => {
-                            match retry_state.should_retry(&e) {
-                                Ok((info, duration)) => {
-                                    tracing::info!("retrying error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
-                                    tokio::time::sleep(duration).await;
-                                    continue 'retry;
-                                }
-                                Err(e) => {
-                                    if $emit_warn {
-                                        tracing::warn!("{}", e);
-                                    }
-                                    $response.into_error(e);
-                                    break 'retry;
-                                }
-                            }
+                        Err(report) => {
+                            break Err(report);
                         }
                     }
                 }
+                ok => {
+                    break ok;
+                }
             }
         }
-    };
+    }};
 }
 
 #[macro_export]
 macro_rules! with_cancellation {
     ($op:expr, $response:expr) => {
+        with_cancellation!($op, $response, true)
+    };
+    ($op:expr, $response:expr, $emit_warn: expr) => {
         $response.ensure_active();
         tokio::select! {
             _ = $response.cancelled() => {
@@ -423,7 +530,9 @@ macro_rules! with_cancellation {
                     $response.success(v);
                 },
                 Err(e) => {
-                    tracing::warn!("{}", e);
+                    if $emit_warn {
+                        tracing::warn!("{}", e);
+                    }
                     $response.into_error(e);
                 }
             }
@@ -456,6 +565,45 @@ macro_rules! destroy_with_runtime {
                 }
             }
         }
+    };
+}
+
+#[macro_export]
+macro_rules! export_queued_op {
+    ($name: ident, $response: ty, $builder: expr, $($v:ident: $t:ty),+) => {
+        #[no_mangle]
+        pub extern "C" fn $name($($v: $t),+, config: *const RawConfig, response: *mut $response, handle: *const c_void) -> CResult {
+            let response = unsafe { ResponseGuard::new(response, handle) };
+            let config = unsafe { & (*config) };
+            let req_result: Result<Request, (ResponseGuard<$response>, anyhow::Error)> = $builder(config, response);
+            let req = match req_result {
+                Ok(req) => req,
+                Err((response, e)) => {
+                    response.into_error(e);
+                    return CResult::Error;
+                }
+            };
+            match SQ.get() {
+                Some(sq) => {
+                    match sq.try_send(req) {
+                        Ok(_) => CResult::Ok,
+                        Err(flume::TrySendError::Full(req)) => {
+                            req.into_error("object_store_ffi internal channel full, backoff");
+                            CResult::Backoff
+                        }
+                        Err(flume::TrySendError::Disconnected(req)) => {
+                            req.into_error("object_store_ffi internal channel closed (may be missing initialization)");
+                            CResult::Error
+                        }
+                    }
+                }
+                None => {
+                    req.into_error("object_store_ffi internal channel closed (may be missing initialization)");
+                    return CResult::Error;
+                }
+            }
+        }
+
     };
 }
 
@@ -567,63 +715,44 @@ pub extern "C" fn start(
                             break;
                         }
                     };
+                    let raw_config = req.raw_config();
+                    let client = tokio::select! {
+                        _ = req.cancelled() => {
+                            tracing::warn!("operation was cancelled");
+                            req.into_error("operation was cancelled");
+                            continue;
+                        }
+                        res = clients().try_get_with(raw_config.get_hash(), Client::from_raw_config(raw_config)) => match res {
+                            Ok(client) => client,
+                            Err(e) => {
+                                let e = anyhow!(e);
+                                tracing::warn!("{}", crate::error::format_err(&e));
+                                req.into_error(e);
+                                continue;
+                            }
+                        }
+                    };
                     match req {
-                        Request::Get(path, slice, config, response) => {
-                            let client = ensure_client!(response, config);
-                            with_retries_and_cancellation!(
-                                client,
-                                response,
-                                handle_get(client.clone(), slice, &path)
-                            );
+                        Request::Get(path, slice, _config, response) => {
+                            with_cancellation!(client.get(&path, slice), response);
                         }
-                        Request::Put(path, slice, config, response) => {
-                            let client = ensure_client!(response, config);
-                            with_retries_and_cancellation!(
-                                client,
-                                response,
-                                handle_put(client.clone(), slice, &path)
-                            );
+                        Request::Put(path, slice, _config, response) => {
+                            with_cancellation!(client.put(&path, slice.into()), response);
                         }
-                        Request::Delete(path, config, response) => {
-                            let client = ensure_client!(response, config);
-                            with_retries_and_cancellation!(
-                                client,
-                                response,
-                                handle_delete(client.clone(), &path),
-                                false
-                            );
+                        Request::Delete(path, _config, response) => {
+                            with_cancellation!(client.delete(&path), response, false);
                         }
-                        Request::List(prefix, offset, config, response) => {
-                            let client = ensure_client!(response, config);
-                            with_retries_and_cancellation!(
-                                client,
-                                response,
-                                handle_list(client.clone(), &prefix, offset.as_ref())
-                            );
+                        Request::List(prefix, offset, _config, response) => {
+                            with_cancellation!(client.list(&prefix, offset.as_ref()), response);
                         }
-                        Request::ListStream(prefix, offset, config, response) => {
-                            let client = ensure_client!(response, config);
-                            with_retries_and_cancellation!(
-                                client,
-                                response,
-                                handle_list_stream(client.clone(), &prefix, offset.as_ref())
-                            );
+                        Request::ListStream(prefix, offset, _config, response) => {
+                            with_cancellation!(client.list_stream(&prefix, offset.as_ref()), response);
                         }
-                        Request::GetStream(path, size_hint, compression, config, response) => {
-                            let client = ensure_client!(response, config);
-                            with_retries_and_cancellation!(
-                                client,
-                                response,
-                                handle_get_stream(client.clone(), &path, size_hint, compression)
-                            );
+                        Request::GetStream(path, size_hint, compression, _config, response) => {
+                            with_cancellation!(client.get_stream(&path, size_hint, compression), response);
                         }
-                        Request::PutStream(path, compression, config, response) => {
-                            let client = ensure_client!(response, config);
-                            with_retries_and_cancellation!(
-                                client,
-                                response,
-                                handle_put_stream(client.clone(), &path, compression)
-                            );
+                        Request::PutStream(path, compression, _config, response) => {
+                            with_cancellation!(client.put_stream(&path, compression), response);
                         }
                     }
                 }

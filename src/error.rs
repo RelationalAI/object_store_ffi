@@ -1,15 +1,108 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use backoff::backoff::Backoff;
 use object_store::RetryConfig;
 use once_cell::sync::Lazy;
 use std::error::Error as StdError;
 use anyhow::anyhow;
+use thiserror::Error;
 
 // These regexes are used to extract error info from some object_store private errors.
 // We construct the regexes lazily and reuse them due to the runtime compilation cost.
 static CLIENT_ERR_REGEX: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"Client \{ status: (?<status>\d+?),").unwrap());
 static REQWEST_ERR_REGEX: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"Reqwest \{ retries: (?<retries>\d+?), max_retries: (?<max_retries>\d+?),").unwrap());
 
+type BoxedStdError = Box<dyn StdError + Send + Sync + 'static>;
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error(transparent)]
+    Request(#[from] reqwest::Error),
+    #[error("{0}")]
+    ErrorResponse(String),
+    #[error("{0}")]
+    InvalidResponse(String),
+    #[error("Failed to deserialize `{response}` response")]
+    DeserializeResponse {
+        response: String,
+        #[source]
+        source: serde_path_to_error::Error<serde_json::Error>
+    },
+    #[error("Storage referenced as `{0}` is not encrypted")]
+    StorageNotEncrypted(String),
+    #[error("{msg}")]
+    InvalidConfig {
+        msg: String,
+        #[source]
+        source: Option<BoxedStdError>
+    },
+    #[error("Missing required config `{0}`")]
+    RequiredConfig(String),
+    #[error("{0} is not implemented")]
+    NotImplemented(String),
+    #[allow(dead_code)]
+    #[error("{context}")]
+    Context {
+        context: String,
+        #[source]
+        source: BoxedStdError
+    },
+    #[error(transparent)]
+    Wrapped(#[from] Arc<Error>)
+    // #[error(transparent)]
+    // Other(#[from] anyhow::Error)
+}
+
+impl Error {
+    #[allow(unused)]
+    pub(crate) fn not_implemented(msg: impl Into<String>) -> Error { Error::NotImplemented(msg.into()) }
+    pub(crate) fn required_config(msg: impl Into<String>) -> Error { Error::RequiredConfig(msg.into()) }
+    pub(crate) fn invalid_config(msg: impl Into<String>) -> Error { Error::InvalidConfig { msg: msg.into(), source: None } }
+    pub(crate) fn invalid_config_src(msg: impl Into<String>, source: impl Into<BoxedStdError>) -> Error {
+        Error::InvalidConfig { msg: msg.into(), source: Some(source.into()) }
+    }
+    pub(crate) fn invalid_config_err<E>(msg: &'static str) -> impl Fn(E) -> Error
+    where
+        E: Into<Box<dyn StdError + Send + Sync + 'static>>
+    {
+        return |e: E| Error::InvalidConfig { msg: msg.into(), source: Some(e.into()) }
+    }
+    #[allow(unused)]
+    pub(crate) fn deserialize_response(msg: impl Into<String>, error: serde_path_to_error::Error<serde_json::Error>) -> Error {
+        Error::DeserializeResponse { response: msg.into(), source: error }
+    }
+    pub(crate) fn deserialize_response_err(msg: &'static str) -> impl Fn(serde_path_to_error::Error<serde_json::Error>) -> Error
+    {
+        return |e| Error::DeserializeResponse { response: msg.into(), source: e }
+    }
+    pub(crate) fn invalid_response(msg: impl Into<String>) -> Error { Error::InvalidResponse(msg.into()) }
+    pub(crate) fn error_response(msg: impl Into<String>) -> Error { Error::ErrorResponse(msg.into()) }
+    pub(crate) fn retryable(&self) -> bool {
+        match self {
+            Error::Request(_)
+            | Error::ErrorResponse(_)
+            | Error::InvalidResponse(_)
+            | Error::DeserializeResponse { .. } => {
+                true
+            },
+            Error::StorageNotEncrypted(_)
+            | Error::InvalidConfig { .. }
+            | Error::RequiredConfig(_)
+            | Error::NotImplemented(_) => {
+                false
+            }
+            Error::Wrapped(e) => e.retryable(),
+            Error::Context { source, .. } => {
+                match source.downcast_ref::<Error>() {
+                    Some(e) => e.retryable(),
+                    None => false
+                }
+            }
+        }
+    }
+}
+
+pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ErrorInfo {
