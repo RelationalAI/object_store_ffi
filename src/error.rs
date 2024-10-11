@@ -196,30 +196,6 @@ pub enum Kind {
 }
 
 impl Kind {
-//     pub(crate) fn retryable(&self) -> bool {
-//         match self {
-//             Kind::Request(_)
-//             | Kind::InvalidResponse(_)
-//             | Kind::DeserializeResponse { .. } => {
-//                 true
-//             },
-//             Kind::StorageNotEncrypted(_)
-//             | Kind::InvalidConfig { .. }
-//             | Kind::RequiredConfig(_)
-//             | Kind::ErrorResponse(_)
-//             | Kind::NotImplemented(_) => {
-//                 false
-//             }
-//             Kind::Wrapped(e) => e.kind.retryable(),
-//             Kind::Context { source, .. } => {
-//                 match source.downcast_ref::<Error>() {
-//                     Some(e) => e.kind.retryable(),
-//                     None => false
-//                 }
-//             }
-//         }
-//     }
-
     pub(crate) fn chain(&self) -> Chain {
         Chain(Some(self))
     }
