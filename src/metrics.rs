@@ -1,5 +1,83 @@
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Instant;
+
+use metrics::{describe_histogram, histogram, Unit};
+
+macro_rules! metric_const {
+    ($name: ident) => {
+        #[allow(non_upper_case_globals)]
+        pub(crate) const $name: &'static str = stringify!($name);
+    };
+}
+
+metric_const!(get_attempt_duration);
+metric_const!(put_attempt_duration);
+metric_const!(delete_attempt_duration);
+metric_const!(multipart_get_attempt_duration);
+metric_const!(multipart_put_attempt_duration);
+metric_const!(material_for_write_duration);
+metric_const!(material_from_metadata_duration);
+metric_const!(list_attempt_duration);
+metric_const!(sf_heartbeat_duration);
+metric_const!(sf_token_refresh_duration);
+metric_const!(sf_token_login_duration);
+metric_const!(sf_query_attempt_duration);
+metric_const!(sf_fetch_upload_info_retried_duration);
+metric_const!(sf_fetch_path_info_retried_duration);
+metric_const!(sf_get_presigned_url_retried_duration);
+metric_const!(total_get_ops);
+metric_const!(total_put_ops);
+metric_const!(total_delete_ops);
+metric_const!(total_keyring_get);
+metric_const!(total_keyring_miss);
+
+#[allow(dead_code)]
+pub fn init_metrics() {
+    describe_histogram!(get_attempt_duration, Unit::Seconds, "Duration of a get operation attempt");
+    describe_histogram!(put_attempt_duration, Unit::Seconds, "Duration of a put operation attempt");
+    describe_histogram!(delete_attempt_duration, Unit::Seconds, "Duration of a delete operation attempt");
+    describe_histogram!(multipart_get_attempt_duration, Unit::Seconds, "Duration of a multipart get operation attempt");
+    describe_histogram!(multipart_put_attempt_duration, Unit::Seconds, "Duration of a multipart put operation attempt");
+    describe_histogram!(material_from_metadata_duration, Unit::Seconds, "Time to get a potentially cached key");
+    describe_histogram!(material_for_write_duration, Unit::Seconds, "Time to fetch a potentially cached key for writes");
+    describe_histogram!(list_attempt_duration, Unit::Seconds, "Duration of a list operation attempt");
+    describe_histogram!(sf_token_refresh_duration, Unit::Seconds, "Time to refresh a token from SF");
+    describe_histogram!(sf_token_login_duration, Unit::Seconds, "Time to get the first token from SF");
+    describe_histogram!(sf_query_attempt_duration, Unit::Seconds, "Time to perform a SF query attempt");
+    describe_histogram!(sf_fetch_upload_info_retried_duration, Unit::Seconds, "Time to fetch a new write key from SF");
+    describe_histogram!(sf_fetch_path_info_retried_duration, Unit::Seconds, "Time to fetch the key for a path from SF");
+    describe_histogram!(sf_get_presigned_url_retried_duration, Unit::Seconds, "Time to fetch a presigned url from SF");
+}
+
+pub(crate) struct DurationGuard {
+    name: &'static str,
+    t0: Instant,
+    discarded: AtomicBool
+}
+impl DurationGuard {
+    pub(crate) fn new(name: &'static str) -> DurationGuard {
+        DurationGuard { name, t0: Instant::now(), discarded: AtomicBool::new(false) }
+    }
+    pub(crate) fn discard(&self) {
+        self.discarded.store(true, Ordering::Relaxed)
+    }
+}
+
+impl Drop for DurationGuard {
+    fn drop(&mut self) {
+        if !self.discarded.load(Ordering::Relaxed) {
+            histogram!(self.name).record(Instant::now() - self.t0);
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! duration_on_drop {
+    ($name: expr) => {
+        crate::metrics::DurationGuard::new($name)
+    };
+}
 
 #[derive(Debug, Default)]
 #[repr(C)]

@@ -1,7 +1,7 @@
 use crate::encryption::{CrypterReader, CrypterWriter, Mode};
 use crate::{destroy_with_runtime, export_queued_op, with_retries, BoxedReader, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
 use crate::util::{size_to_ranges, Compression, CompressedWriter, with_decoder, cstr_to_path};
-use crate::error::RetryState;
+use crate::error::{Kind as ErrorKind, RetryState};
 use crate::with_cancellation;
 
 use object_store::{path::Path, ObjectStore};
@@ -14,38 +14,42 @@ use std::sync::Arc;
 use futures_util::{StreamExt, TryStreamExt};
 
 impl Client {
-    async fn put_stream_impl(&self, path: &Path, compression: Compression) -> anyhow::Result<BoxedUpload> {
+    async fn put_stream_impl(&self, path: &Path, compression: Compression) -> crate::Result<BoxedUpload> {
         let path = &self.full_path(path);
+        let part_size = self.config.multipart_put_part_size;
+        let concurrency = self.config.multipart_put_concurrency;
         let writer: BoxedUpload = if let Some(cryptmp) = self.crypto_material_provider.as_ref() {
             let (material, attrs) = cryptmp.material_for_write(path.as_ref(), None).await?;
             let writer = object_store::buffered::BufWriter::with_capacity(
                 Arc::clone(&self.store),
                 path.clone(),
-                10 * 1024 * 1024
+                part_size
             )
                 .with_attributes(attrs)
-                .with_max_concurrency(64);
-            let encrypter_writer = CrypterWriter::new(writer, Mode::Encrypt, &material)?;
+                .with_max_concurrency(concurrency);
+            let encrypter_writer = CrypterWriter::new(writer, Mode::Encrypt, &material)
+                .map_err(ErrorKind::ContentEncrypt)?;
             Box::new(encrypter_writer)
         } else {
             Box::new(
                 object_store::buffered::BufWriter::with_capacity(
                     Arc::clone(&self.store),
                     path.clone(),
-                    10 * 1024 * 1024
+                    part_size
                 )
-                .with_max_concurrency(64)
+                .with_max_concurrency(concurrency)
             )
         };
 
         let encoded = CompressedWriter::new(compression, writer);
         return Ok(Box::new(encoded));
     }
-    pub(crate) async fn put_stream(&self, path: &Path, compression: Compression) -> anyhow::Result<BoxedUpload> {
+    pub(crate) async fn put_stream(&self, path: &Path, compression: Compression) -> crate::Result<BoxedUpload> {
         with_retries!(self, self.put_stream_impl(path, compression).await)
     }
-    async fn get_stream_impl(&self, path: &Path, _size_hint: usize, compression: Compression) -> anyhow::Result<BoxedReader> {
+    async fn get_stream_impl(&self, path: &Path, _size_hint: usize, compression: Compression) -> crate::Result<BoxedReader> {
         let path = &self.full_path(path);
+        // Perform head request and prefetch parts in parallel
         let result = self.store.get_opts(
             &path,
             object_store::GetOptions {
@@ -53,8 +57,7 @@ impl Client {
                 ..Default::default()
             }
         ).await?;
-        // Perform head request and prefetch parts in parallel
-        let part_ranges = size_to_ranges(result.meta.size);
+        let part_ranges = size_to_ranges(result.meta.size, self.config.multipart_get_part_size);
 
         let state = (
             self.clone(),
@@ -71,17 +74,17 @@ impl Client {
                     'retry: loop {
                         match client.store.get_range(&path, range.clone()).await.map_err(Into::into) {
                             Ok(bytes) => {
-                                return Ok::<_, anyhow::Error>(bytes)
+                                return Ok::<_, crate::error::Error>(bytes)
                             },
                             Err(e) => {
-                                match retry_state.should_retry(&e) {
-                                    Ok((info, duration)) => {
+                                match retry_state.should_retry(e) {
+                                    Ok((e, info, duration)) => {
                                         tracing::info!("retrying get stream error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
                                         tokio::time::sleep(duration).await;
                                         continue 'retry;
                                     }
-                                    Err(report) => {
-                                        tracing::warn!("[get stream] {}", report);
+                                    Err(e) => {
+                                        tracing::warn!("[get stream] {}", e);
                                         return Err(e);
                                     }
                                 }
@@ -90,13 +93,14 @@ impl Client {
                     }
                 }).await?;
             })
-            .buffered(64)
+            .buffered(self.config.multipart_get_concurrency)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
             .boxed();
 
         let reader: Box<dyn AsyncBufRead + Send + Unpin> = if let Some(cryptmp) = self.crypto_material_provider.as_ref() {
             let material = cryptmp.material_from_metadata(path.as_ref(), &result.attributes).await?;
-            let decrypter_reader = CrypterReader::new(StreamReader::new(stream), Mode::Decrypt, &material)?;
+            let decrypter_reader = CrypterReader::new(StreamReader::new(stream), Mode::Decrypt, &material)
+                .map_err(ErrorKind::ContentDecrypt)?;
             let buffer_reader = BufReader::with_capacity(64 * 1024, decrypter_reader);
             Box::new(buffer_reader)
         } else {
@@ -106,7 +110,7 @@ impl Client {
         let decoded = with_decoder(compression, reader);
         return Ok(Box::new(decoded));
     }
-    pub(crate) async fn get_stream(&self, path: &Path, size_hint: usize, compression: Compression) -> anyhow::Result<BoxedReader> {
+    pub(crate) async fn get_stream(&self, path: &Path, size_hint: usize, compression: Compression) -> crate::Result<BoxedReader> {
         with_retries!(self, self.get_stream_impl(path, size_hint, compression).await)
     }
 }

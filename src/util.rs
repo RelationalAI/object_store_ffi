@@ -1,17 +1,13 @@
-use crate::static_config;
-
 use std::ops::Range;
 use std::ffi::c_char;
 use anyhow::anyhow;
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncBufRead, AsyncWrite};
 
-pub(crate) fn size_to_ranges(object_size: usize) -> Vec<Range<usize>> {
+pub(crate) fn size_to_ranges(object_size: usize, part_size: usize) -> Vec<Range<usize>> {
     if object_size == 0 {
         return vec![];
     }
-
-    let part_size: usize = static_config().multipart_get_part_size as usize;
 
     // If the object size happens to be smaller than part_size,
     // then we will end up doing a single range get of the whole
@@ -62,12 +58,12 @@ impl TryFrom<*const c_char> for Compression {
 
 #[async_trait::async_trait]
 pub(crate) trait AsyncUpload: AsyncWrite {
-    async fn abort(&mut self) -> anyhow::Result<()>;
+    async fn abort(&mut self) -> crate::Result<()>;
 }
 
 #[async_trait::async_trait]
 impl AsyncUpload for object_store::buffered::BufWriter {
-    async fn abort(&mut self) -> anyhow::Result<()> {
+    async fn abort(&mut self) -> crate::Result<()> {
         Ok(object_store::buffered::BufWriter::abort(self).await?)
     }
 }
@@ -115,7 +111,7 @@ impl<T: AsyncWrite> CompressedWriter<T> {
 
 #[async_trait::async_trait]
 impl<T: AsyncUpload + Send> AsyncUpload for CompressedWriter<T> {
-    async fn abort(&mut self) -> anyhow::Result<()> {
+    async fn abort(&mut self) -> crate::Result<()> {
         let writer = match &mut self.encoder {
             Encoder::None(e) => e,
             Encoder::Gzip(e) => e.get_mut(),
@@ -130,7 +126,7 @@ impl<T: AsyncUpload + Send> AsyncUpload for CompressedWriter<T> {
 
 #[async_trait::async_trait]
 impl AsyncUpload for CompressedWriter<Box<dyn AsyncUpload + Send + Unpin>> {
-    async fn abort(&mut self) -> anyhow::Result<()> {
+    async fn abort(&mut self) -> crate::Result<()> {
         let writer = match &mut self.encoder {
             Encoder::None(e) => e,
             Encoder::Gzip(e) => e.get_mut(),

@@ -1,4 +1,4 @@
-use crate::{destroy_with_runtime, error::RetryState, export_queued_op, util::{cstr_to_path, string_to_path}, with_cancellation, with_retries, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
+use crate::{destroy_with_runtime, duration_on_drop, export_queued_op, metrics, util::{cstr_to_path, string_to_path}, with_cancellation, with_retries, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
 
 use object_store::{path::Path, ObjectStore, ObjectMeta};
 use pin_project::{pin_project, pinned_drop};
@@ -95,22 +95,23 @@ impl Stream for ListStream {
 }
 
 impl Client {
-    async fn list_impl(&self, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<Vec<ObjectMeta>> {
+    async fn list_impl(&self, prefix: &Path, offset: Option<&Path>) -> crate::Result<Vec<ObjectMeta>> {
+        let _guard = duration_on_drop!(metrics::list_attempt_duration);
         let stream = self.list_stream_impl(prefix, offset).await?;
         let entries: Vec<_> = stream.collect().await;
         let entries = entries.into_iter().flatten().collect::<Result<Vec<_>, _>>()?;
         Ok(entries)
     }
-    pub(crate) async fn list(&self, path: &Path, offset: Option<&Path>) -> anyhow::Result<Vec<ObjectMeta>> {
+    pub(crate) async fn list(&self, path: &Path, offset: Option<&Path>) -> crate::Result<Vec<ObjectMeta>> {
         with_retries!(self, self.list_impl(path, offset).await)
     }
-    async fn list_stream_impl(&self, prefix: &Path, offset: Option<&Path>) -> anyhow::Result<ListStream> {
+    async fn list_stream_impl(&self, prefix: &Path, offset: Option<&Path>) -> crate::Result<ListStream> {
         let prefix = &self.full_path(prefix);
         let offset = offset.map(|o| self.full_path(o));
 
         Ok(ListStream::new(&self, prefix, offset.as_ref()))
     }
-    pub(crate) async fn list_stream(&self, path: &Path, offset: Option<&Path>) -> anyhow::Result<ListStream> {
+    pub(crate) async fn list_stream(&self, path: &Path, offset: Option<&Path>) -> crate::Result<ListStream> {
         with_retries!(self, self.list_stream_impl(path, offset).await)
     }
 }

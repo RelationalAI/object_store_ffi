@@ -1,8 +1,8 @@
-use crate::{clients, encryption::{CryptoMaterialProvider, CryptoScheme}, error::Error, CResult, Client, ClientExtension, Context, Extension, NotifyGuard, RawConfig, RawResponse, ResponseGuard};
+use crate::{clients, encryption::{CryptoMaterialProvider, CryptoScheme}, error::{Error, ErrorExt, Kind as ErrorKind}, CResult, Client, ClientExtension, Context, Extension, NotifyGuard, RawConfig, RawResponse, ResponseGuard};
 use crate::{RT, with_cancellation};
 
 pub(crate) mod client;
-use anyhow::anyhow;
+use anyhow::Context as AnyhowContext;
 use client::{NormalizedStageInfo, SnowflakeClient, SnowflakeClientConfig};
 
 pub(crate) mod kms;
@@ -26,14 +26,15 @@ impl Extension for SnowflakeS3Extension {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    async fn current_stage_info(&self) -> anyhow::Result<String> {
+    async fn current_stage_info(&self) -> crate::Result<String> {
         let stage_info = &self
             .client
             .current_upload_info(&self.stage)
             .await?
             .stage_info;
         let stage_info: NormalizedStageInfo = stage_info.try_into()?;
-        let string = serde_json::to_string(&stage_info)?;
+        let string = serde_json::to_string(&stage_info)
+            .context("failed to encode stage_info as json").to_err()?;
         Ok(string)
     }
 }
@@ -139,9 +140,8 @@ pub extern "C" fn current_stage_info(
             runtime.spawn(async move {
                 let info_op = async {
                     let client = clients()
-                        .try_get_with(config.get_hash(), Client::from_raw_config(config)).await
-                        .map_err(|e| anyhow!(e))?;
-                    Ok::<_, anyhow::Error>(client.extension.current_stage_info().await?)
+                        .try_get_with(config.get_hash(), Client::from_raw_config(config)).await?;
+                    Ok::<_, crate::Error>(client.extension.current_stage_info().await?)
                 };
 
                 with_cancellation!(info_op, response);
@@ -162,7 +162,7 @@ pub(crate) struct SnowflakeConfig {
     pub kms_config: Option<SnowflakeStageKmsConfig>
 }
 
-pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, retry_config: RetryConfig) -> anyhow::Result<SnowflakeConfig> {
+pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, retry_config: RetryConfig) -> crate::Result<SnowflakeConfig> {
     let mut required_or_env = |field: &str| {
         map
             .remove(field)
@@ -183,6 +183,11 @@ pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, r
         password: map.remove("snowflake_password").or(std::env::var("SNOWFLAKE_PASSWORD").ok()),
         role: map.remove("snowflake_role").or(std::env::var("SNOWFLAKE_ROLE").ok()),
         master_token_path: map.remove("snowflake_master_token_path").or(std::env::var("MASTER_TOKEN_PATH").ok()),
+        stage_info_cache_ttl: map.remove("snowflake_stage_info_cache_ttl_secs")
+            .map(|s| s.parse::<u64>())
+            .transpose()
+            .map_err(|e| Error::invalid_config_src("Failed to parse `snowflake_stage_info_cache_ttl_secs`", e))?
+            .map(|n| std::time::Duration::from_secs(n)),
         retry_config
     };
 
@@ -196,12 +201,12 @@ pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, r
            keyring_capacity: match map.remove("snowflake_keyring_capacity").map(|s| s.parse::<usize>()) {
                Some(Ok(cap)) => cap,
                Some(Err(e)) => return Err(Error::invalid_config_src("Failed to parse `snowflake_keyring_capacity`", e).into()),
-               None => Default::default()
+               None => 100_000
            },
            keyring_ttl: match map.remove("snowflake_keyring_ttl_secs").map(|s| s.parse::<u64>()) {
                Some(Ok(secs)) => std::time::Duration::from_secs(secs),
                Some(Err(e)) => return Err(Error::invalid_config_src("Failed to parse `snowflake_keyring_ttl_secs`", e).into()),
-               None => Default::default()
+               None => std::time::Duration::from_secs(10 * 60)
            }
         })
     } else {
@@ -227,7 +232,7 @@ pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, r
 pub(crate) async fn build_store_for_snowflake_stage(
     mut config_map: HashMap<String, String>,
     retry_config: RetryConfig
-) -> anyhow::Result<(
+) -> crate::Result<(
     Arc<dyn ObjectStore>,
     Option<Arc<dyn CryptoMaterialProvider>>,
     String,
@@ -280,7 +285,7 @@ pub(crate) async fn build_store_for_snowflake_stage(
             };
 
             if config.kms_config.is_some() && !info.stage_info.is_client_side_encrypted {
-                return Err(Error::StorageNotEncrypted(config.stage.clone()).into());
+                return Err(ErrorKind::StorageNotEncrypted(config.stage.clone()).into());
             }
 
             let crypto_material_provider = if info.stage_info.is_client_side_encrypted {

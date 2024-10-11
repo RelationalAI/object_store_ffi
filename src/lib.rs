@@ -2,6 +2,7 @@
 static GLOBAL: metrics::InstrumentedAllocator = metrics::InstrumentedAllocator {};
 
 use encryption::CryptoMaterialProvider;
+use error::Error;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
 use tokio::io::AsyncRead;
@@ -11,7 +12,6 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::sync::Arc;
 use std::time::Duration;
-use anyhow::anyhow;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
@@ -22,7 +22,7 @@ use object_store::{path::Path, ObjectStore};
 use moka::future::Cache;
 
 mod util;
-use util::{string_to_path, AsyncUpload, Compression};
+use util::{deserialize_str, string_to_path, AsyncUpload, Compression};
 
 mod error;
 pub(crate) use error::Result;
@@ -271,16 +271,17 @@ impl RawConfig {
         config_string.to_str().expect("julia strings are valid utf8")
     }
 
-    fn as_json(&self) -> anyhow::Result<serde_json::Value> {
-        Ok(serde_json::from_str(self.as_str())?)
+    fn as_json(&self) -> crate::Result<serde_json::Value> {
+        let json = deserialize_str(self.as_str())
+            .map_err(Error::invalid_config_err("failed to parse json serialized config"))?;
+        Ok(json)
     }
 
-    fn as_map(&self) -> anyhow::Result<HashMap<String, String>> {
-        let value = self.as_json()
-            .map_err(|e| anyhow!("failed to parse json serialized config: {}", e))?;
+    fn as_map(&self) -> crate::Result<HashMap<String, String>> {
+        let value = self.as_json()?;
 
         let map: HashMap<String, String> = serde_json::from_value(value)
-            .map_err(|e| anyhow!("config must be a json serialized object: {}", e))?;
+            .map_err(Error::invalid_config_err("config must be a json serialized object"))?;
 
         Ok(map)
     }
@@ -289,15 +290,63 @@ impl RawConfig {
 #[derive(Debug, Clone)]
 struct Config {
     prefix: Option<String>,
-    retry_config: RetryConfig
+    retry_config: RetryConfig,
+    multipart_get_threshold: usize,
+    multipart_get_part_size: usize,
+    multipart_get_concurrency: usize,
+    multipart_put_threshold: usize,
+    multipart_put_part_size: usize,
+    multipart_put_concurrency: usize
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            prefix: None,
+            retry_config: RetryConfig::default(),
+            multipart_get_threshold: 8 * 1024 * 1024,
+            multipart_get_part_size: 8 * 1024 * 1024,
+            multipart_get_concurrency: 16,
+            multipart_put_threshold: 10 * 1024 * 1024,
+            multipart_put_part_size: 10 * 1024 * 1024,
+            multipart_put_concurrency: 16
+        }
+    }
+}
+
+macro_rules! extract_and_parse {
+    ($map: expr, $config: expr, $field: ident) => {
+        $map.remove(stringify!($field))
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|e| Error::invalid_config_src(format!("failed to parse {}", stringify!($field)), e))?
+            .inspect(|v| {
+                $config.$field = *v;
+            });
+    };
+}
+
+impl Config {
+    fn extract_from_map(map: &mut HashMap<String, String>) -> crate::Result<Config> {
+        let mut config = Config::default();
+        config.retry_config = parse_retry_config(map)?;
+        config.prefix = map.remove("prefix");
+        extract_and_parse!(map, config, multipart_get_threshold);
+        extract_and_parse!(map, config, multipart_get_part_size);
+        extract_and_parse!(map, config, multipart_get_concurrency);
+        extract_and_parse!(map, config, multipart_put_threshold);
+        extract_and_parse!(map, config, multipart_put_part_size);
+        extract_and_parse!(map, config, multipart_put_concurrency);
+        Ok(config)
+    }
 }
 
 #[async_trait::async_trait]
 pub(crate) trait Extension: std::fmt::Debug + Send + Sync + 'static {
     #[allow(dead_code)]
     fn as_any(&self) -> &dyn Any;
-    async fn current_stage_info(&self) -> anyhow::Result<String> {
-        return Err(anyhow!("current_stage_info is not implemented"));
+    async fn current_stage_info(&self) -> crate::Result<String> {
+        return Err(Error::not_implemented("current_stage_info is not implemented for this client"));
     }
 }
 
@@ -319,19 +368,19 @@ pub struct Client {
 
 impl Client {
     // Caution: This function is not retried, retries must be handled internally.
-    async fn from_raw_config(config: &RawConfig) -> anyhow::Result<Client> {
+    async fn from_raw_config(config: &RawConfig) -> crate::Result<Client> {
         Ok(Client::from_config_map(config.as_map()?).await?)
     }
-    async fn from_config_map(mut map: HashMap<String, String>) -> anyhow::Result<Client> {
+    async fn from_config_map(mut map: HashMap<String, String>) -> crate::Result<Client> {
         let url = map.remove("url")
-            .ok_or(anyhow!("config object must have a key named 'url'"))?;
+            .ok_or(Error::invalid_config("config object must have a key named 'url'"))?;
 
         let url = url::Url::parse(&url)
-            .map_err(|e| anyhow!("failed to parse `url`: {}", e))?;
+            .map_err(Error::invalid_config_err("failed to parse `url`"))?;
 
         if let Some(v) = map.remove("azurite_host") {
             let mut azurite_host = url::Url::parse(&v)
-                .map_err(|e| anyhow!("failed to parse azurite_host: {}", e))?;
+                .map_err(Error::invalid_config_err("failed to parse azurite_host"))?;
             azurite_host.set_path("");
             unsafe { std::env::set_var("AZURITE_BLOB_STORAGE_URL", azurite_host.as_str()) };
             map.insert("allow_invalid_certificates".into(), "true".into());
@@ -340,21 +389,19 @@ impl Client {
 
         if let Some(v) = map.remove("minio_host") {
             let mut minio_host = url::Url::parse(&v)
-                .map_err(|e| anyhow!("failed to parse minio_host: {}", e))?;
+                .map_err(Error::invalid_config_err("failed to parse minio_host"))?;
             minio_host.set_path("");
             map.insert("allow_http".into(), "true".into());
             map.insert("aws_endpoint".into(), minio_host.as_str().trim_end_matches('/').to_string());
         }
 
-        let retry_config = parse_retry_config(&mut map)?;
-
-        let user_prefix = map.remove("prefix");
+        let mut config = Config::extract_from_map(&mut map)?;
 
         let client = match url.scheme() {
             "s3" => {
                 let mut builder = object_store::aws::AmazonS3Builder::default()
                     .with_url(url)
-                    .with_retry(retry_config.clone());
+                    .with_retry(config.retry_config.clone());
                 for (key, value) in map {
                     builder = builder.with_config(key.parse()?, value);
                 }
@@ -362,17 +409,14 @@ impl Client {
                 Client {
                     store: Arc::new(builder.build()?),
                     crypto_material_provider: None,
-                    config: Config {
-                        prefix: user_prefix,
-                        retry_config
-                    },
+                    config,
                     extension: Arc::new(()),
                 }
             }
             "az" | "azure" => {
                 let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
                     .with_url(url)
-                    .with_retry(retry_config.clone());
+                    .with_retry(config.retry_config.clone());
                 for (key, value) in map {
                     builder = builder.with_config(key.parse()?, value);
                 }
@@ -380,29 +424,25 @@ impl Client {
                 Client {
                     store: Arc::new(builder.build()?),
                     crypto_material_provider: None,
-                    config: Config {
-                        prefix: user_prefix,
-                        retry_config
-                    },
+                    config,
                     extension: Arc::new(())
                 }
             }
             "snowflake" => {
-                let (store, crypto_material_provider, stage_prefix, extension) = build_store_for_snowflake_stage(map, retry_config.clone()).await?;
+                let (store, crypto_material_provider, stage_prefix, extension) = build_store_for_snowflake_stage(map, config.retry_config.clone()).await?;
 
-                let prefix = match (stage_prefix, user_prefix) {
+                let prefix = match (stage_prefix, config.prefix) {
                     (s, Some(u)) if s.ends_with("/") => Some(format!("{s}{u}")),
                     (s, Some(u)) => Some(format!("{s}/{u}")),
                     (s, None) => Some(s)
                 };
 
+                config.prefix = prefix;
+
                 Client {
                     store,
                     crypto_material_provider,
-                    config: Config {
-                        prefix,
-                        retry_config
-                    },
+                    config,
                     extension
                 }
             }
@@ -429,30 +469,30 @@ impl Client {
     }
 }
 
-fn parse_retry_config(map: &mut HashMap<String, String>) -> anyhow::Result<RetryConfig> {
+fn parse_retry_config(map: &mut HashMap<String, String>) -> crate::Result<RetryConfig> {
     let mut retry_config = RetryConfig::default();
     if let Some(value) = map.remove("max_retries") {
         retry_config.max_retries = value.parse()
-            .map_err(|e| anyhow!("failed to parse max_retries: {}", e))?;
+            .map_err(Error::invalid_config_err("failed to parse max_retries"))?;
     }
     if let Some(value) = map.remove("retry_timeout_secs") {
         retry_config.retry_timeout = std::time::Duration::from_secs(value.parse()
-            .map_err(|e| anyhow!("failed to parse retry_timeout_sec: {}", e))?
+            .map_err(Error::invalid_config_err("failed to parse retry_timeout_secs"))?
         );
     }
     if let Some(value) = map.remove("initial_backoff_ms") {
         retry_config.backoff.init_backoff = std::time::Duration::from_millis(value.parse()
-            .map_err(|e| anyhow!("failed to parse initial_backoff_ms: {}", e))?
+            .map_err(Error::invalid_config_err("failed to parse initial_backoff_ms"))?
         );
     }
     if let Some(value) = map.remove("max_backoff_ms") {
         retry_config.backoff.max_backoff = std::time::Duration::from_millis(value.parse()
-            .map_err(|e| anyhow!("failed to parse max_backoff_ms: {}", e))?
+            .map_err(Error::invalid_config_err("failed to parse max_backoff_ms"))?
         );
     }
     if let Some(value) = map.remove("backoff_exp_base") {
         retry_config.backoff.base = value.parse()
-            .map_err(|e| anyhow!("failed to parse backoff_exp_base: {}", e))?;
+            .map_err(Error::invalid_config_err("failed to parse backoff_exp_base"))?;
     }
 
     Ok(retry_config)
@@ -489,18 +529,18 @@ impl Default for StaticConfig {
 #[macro_export]
 macro_rules! with_retries {
     ($this:expr, $op: expr) => {{
-        let mut retry_state = RetryState::new($this.config.retry_config.clone());
+        let mut retry_state = crate::error::RetryState::new($this.config.retry_config.clone());
         'retry: loop {
             match $op {
                 Err(e) => {
-                    match retry_state.should_retry(&e) {
-                        Ok((info, duration)) => {
+                    match retry_state.should_retry(e) {
+                        Ok((e, info, duration)) => {
                             tracing::info!("retrying error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
                             tokio::time::sleep(duration).await;
                             continue 'retry;
                         }
-                        Err(report) => {
-                            break Err(report);
+                        Err(e) => {
+                            break Err(e);
                         }
                     }
                 }
@@ -725,8 +765,7 @@ pub extern "C" fn start(
                         res = clients().try_get_with(raw_config.get_hash(), Client::from_raw_config(raw_config)) => match res {
                             Ok(client) => client,
                             Err(e) => {
-                                let e = anyhow!(e);
-                                tracing::warn!("{}", crate::error::format_err(&e));
+                                tracing::warn!("{}", e);
                                 req.into_error(e);
                                 continue;
                             }

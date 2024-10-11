@@ -1,11 +1,11 @@
-use backoff::backoff::Backoff;
+use ::metrics::counter;
 use object_store::RetryConfig;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
 use moka::future::Cache;
-use crate::error::Error;
+use crate::{duration_on_drop, error::{Error, RetryState}, metrics};
 use crate::util::{deserialize_str, deserialize_slice};
 // use anyhow::anyhow;
 
@@ -242,6 +242,7 @@ pub(crate) struct SnowflakeClientConfig {
     pub password: Option<String>,
     pub role: Option<String>,
     pub master_token_path: Option<String>,
+    pub stage_info_cache_ttl: Option<Duration>,
     pub retry_config: RetryConfig
 }
 
@@ -260,6 +261,7 @@ impl SnowflakeClientConfig {
             password: env::var("SNOWFLAKE_PASSWORD").ok(),
             role: env::var("SNOWFLAKE_ROLE").ok(),
             master_token_path: env::var("MASTER_TOKEN_PATH").ok(),
+            stage_info_cache_ttl: None,
             retry_config: RetryConfig::default()
         })
     }
@@ -291,6 +293,7 @@ impl std::fmt::Debug for SnowflakeClient {
 
 impl SnowflakeClient {
     pub(crate) fn new(config: SnowflakeClientConfig) -> Arc<SnowflakeClient> {
+        let cache_ttl = config.stage_info_cache_ttl.unwrap_or(Duration::from_secs(40 * 60));
         let client = SnowflakeClient {
             config,
             client: reqwest::Client::builder()
@@ -301,7 +304,7 @@ impl SnowflakeClient {
                 .max_capacity(10)
                 // Time to live here manages the stage token lifecycle, removing it from the cache
                 // prior to expiration
-                .time_to_live(std::time::Duration::from_secs(40 * 60))
+                .time_to_live(cache_ttl)
                 .build()
         };
 
@@ -335,7 +338,7 @@ impl SnowflakeClient {
     pub(crate) fn from_env() -> anyhow::Result<Arc<SnowflakeClient>> {
         Ok(SnowflakeClient::new(SnowflakeClientConfig::from_env()?))
     }
-    async fn heartbeat(&self) -> anyhow::Result<bool> {
+    async fn heartbeat(&self) -> crate::Result<bool> {
         let token = {
             let locked = self.token.lock().await;
             match locked.as_ref() {
@@ -346,6 +349,7 @@ impl SnowflakeClient {
             }
         };
 
+        let _guard = duration_on_drop!(metrics::sf_heartbeat_duration);
         let response = self.client.post(format!("{}/session/heartbeat", self.config.endpoint))
             .header("Authorization", format!("Snowflake Token=\"{}\"", token))
             .send()
@@ -367,6 +371,7 @@ impl SnowflakeClient {
         let config = &self.config;
 
         if let Some(TokenState { token, master_token, .. }) = locked.as_ref() {
+            let _guard = duration_on_drop!(metrics::sf_token_refresh_duration);
             // Renew
             let response = self.client.post(format!("{}/session/token-request", config.endpoint))
                 .header("Content-Type", "application/json")
@@ -412,6 +417,7 @@ impl SnowflakeClient {
                 }
             }
         } else {
+            let _guard = duration_on_drop!(metrics::sf_token_login_duration);
             let response = if let (Some(username), Some(password)) = (&config.username, &config.password) {
                 // User Password Login
                 let mut qs = vec![
@@ -504,8 +510,9 @@ impl SnowflakeClient {
             }
         }
     }
-    async fn query_impl<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> crate::Result<SnowflakeResponse<T>> {
+    async fn query_impl<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> crate::Result<T> {
         let token = self.token().await?;
+        let _guard = duration_on_drop!(metrics::sf_query_attempt_duration);
         let config = &self.config;
         let response = self.client.post(format!("{}/queries/v1/query-request", config.endpoint))
             .header("Content-Type", "application/json")
@@ -531,114 +538,70 @@ impl SnowflakeClient {
             .text()
             .await?;
 
-        let response = deserialize_str(&response_string)
+        let response: SnowflakeResponse<T> = deserialize_str(&response_string)
             .map_err(Error::deserialize_response_err("query"))?;
 
-        Ok(response)
+        match response {
+            SnowflakeResponse::Success { data, .. } => {
+                Ok(data)
+            }
+            SnowflakeResponse::Error { data, code, message, .. } => {
+                Err(Error::error_response(format!("Error (code: {}, query_id: {}): {}", code, data.query_id, message)))
+            }
+        }
     }
-
-    async fn query<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> crate::Result<SnowflakeResponse<T>> {
-        let mut backoff = backoff::ExponentialBackoff {
-            initial_interval: self.config.retry_config.backoff.init_backoff,
-            max_interval: self.config.retry_config.backoff.max_backoff,
-            max_elapsed_time: Some(self.config.retry_config.retry_timeout),
-            ..Default::default()
-        };
-        let max_retries = self.config.retry_config.max_retries;
-        let mut retries = 0;
-        loop {
+    async fn query<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> crate::Result<T> {
+        let mut retry_state = RetryState::new(self.config.retry_config.clone());
+        'retry: loop {
             match self.query_impl(query.as_ref()).await {
-                Ok(success @ SnowflakeResponse::Success { .. }) => {
-                    return Ok(success)
-                }
-                Ok(SnowflakeResponse::Error { data, code, message, success }) => {
-                    match (backoff.next_backoff(), retries < max_retries) {
-                        (Some(duration), true) => {
-                            tracing::warn!(
-                                "retrying snowflake query error: Error (code: {}, query_id: {}): {}",
-                                code, data.query_id, message
-                            );
-                            retries += 1;
-                            tokio::time::sleep(duration).await;
-                            continue;
-                        }
-                        _ => {
-                            return Ok(SnowflakeResponse::Error { data, code, message, success });
-                        }
-                    }
-                }
                 Err(e) => {
-                    match (backoff.next_backoff(), retries < max_retries &&  e.retryable()) {
-                        (Some(duration), true) => {
-                            tracing::warn!("retrying snowflake query due to: {}", e);
-                            retries += 1;
+                    match retry_state.should_retry(e) {
+                        Ok((e, info, duration)) => {
+                            tracing::info!("retrying snowflake query error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
                             tokio::time::sleep(duration).await;
-                            continue;
+                            continue 'retry;
                         }
-                        _ => {
-                            return Err(e)
+                        Err(e) => {
+                            break Err(e);
                         }
                     }
+                }
+                ok => {
+                    break ok;
                 }
             }
         }
     }
     pub(crate) async fn fetch_upload_info(&self, stage: impl AsRef<str>) -> crate::Result<SnowflakeUploadData> {
-        let response: SnowflakeResponse<SnowflakeUploadData> = self
+        counter!("total_fetch_upload_info").increment(1);
+        let _guard = duration_on_drop!(metrics::sf_fetch_upload_info_retried_duration);
+        let upload_data: SnowflakeUploadData = self
             .query(format!("PUT file:///tmp/whatever @{}", stage.as_ref()))
             .await?;
 
-        match response {
-            SnowflakeResponse::Success { data, .. } => {
-                Ok(data)
-            }
-            SnowflakeResponse::Error { message, code, data, .. } => {
-                if code == "333334" {
-                    tracing::error!("unexpected async execution response for query {} while fetching upload info", data.query_id);
-                }
-                return Err(Error::error_response(format!("Error (code: {}, query_id: {}): {}", code, data.query_id, message)).into())
-            }
-        }
+        Ok(upload_data)
     }
     pub(crate) async fn fetch_path_info(&self, stage: impl AsRef<str>, path: impl AsRef<str>) -> crate::Result<SnowflakeDownloadData> {
-        let response: SnowflakeResponse<SnowflakeDownloadData> = self
+        counter!("total_fetch_path_info").increment(1);
+        let _guard = duration_on_drop!(metrics::sf_fetch_path_info_retried_duration);
+        let download_data: SnowflakeDownloadData = self
             .query(format!("GET @{}/{} file:///tmp/whatever", stage.as_ref(), path.as_ref()))
             .await?;
 
-        match response {
-            SnowflakeResponse::Success { data, .. } => {
-                Ok(data)
-            }
-            SnowflakeResponse::Error { message, code, data, .. } => {
-                if code == "333334" {
-                    tracing::error!("unexpected async execution response for query {} while fetching path info", data.query_id);
-                }
-                return Err(Error::error_response(format!("Error (code: {}, query_id: {}): {}", code, data.query_id, message)).into())
-            }
-        }
+        Ok(download_data)
     }
     #[allow(unused)]
     pub(crate) async fn get_presigned_url(&self, stage: impl AsRef<str>, path: impl AsRef<str>) -> crate::Result<String> {
-        let response: SnowflakeResponse<SnowflakeQueryData> = self
+        let _guard = duration_on_drop!(metrics::sf_get_presigned_url_retried_duration);
+        let query_data: SnowflakeQueryData = self
             .query(format!("SELECT get_presigned_url(@{}, '{}')", stage.as_ref(), path.as_ref()))
             .await?;
-
-        match response {
-            SnowflakeResponse::Success { data, .. } => {
-                let url = data.rowset
-                    .get(0)
-                    .and_then(|r| r.get(0))
-                    .and_then(|c| c.as_str())
-                    .ok_or_else(|| Error::invalid_response("Missing url from get_presigned_url response"))?;
-                Ok(url.to_string())
-            }
-            SnowflakeResponse::Error { message, code, data, .. } => {
-                if code == "333334" {
-                    tracing::error!("unexpected async execution response for query {} while fetching path info", data.query_id);
-                }
-                return Err(Error::error_response(format!("Error (code: {}, query_id: {}): {}", code, data.query_id, message)).into())
-            }
-        }
+        let url = query_data.rowset
+            .get(0)
+            .and_then(|r| r.get(0))
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| Error::invalid_response("Missing url from get_presigned_url response"))?;
+        Ok(url.to_string())
     }
     pub(crate) async fn current_upload_info(&self, stage: impl AsRef<str>) -> crate::Result<Arc<SnowflakeUploadData>> {
         let stage = stage.as_ref();
@@ -652,5 +615,161 @@ impl SnowflakeClient {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
 
+    use crate::{metrics::init_metrics, Client};
+    use super::*;
+    // use futures_util::StreamExt;
+    use ::metrics::Unit;
+    use metrics_util::debugging::Snapshot;
+    use object_store::path::Path;
 
+    fn format_unit(unit: Option<Unit>, v: f64) -> String {
+        match unit {
+            Some(Unit::Seconds) => format!("{:?}", Duration::from_secs_f64(v)),
+            _ => format!("{}", v)
+        }
+    }
+    fn print_snapshot(snapshot: Snapshot) {
+        println!("=======================");
+        for (key, unit, _shared, value) in snapshot.into_vec() {
+            let (_kind, key) = key.into_parts();
+            let f = |v| format_unit(unit, v);
+            let value_str = match value {
+                metrics_util::debugging::DebugValue::Histogram(mut vals) => {
+                    vals.sort();
+                    let p = |v: f64| {
+                        if vals.len() == 0 {
+                            0.0f64
+                        } else {
+                            *vals[((vals.len() as f64 * v).floor() as usize).min(vals.len() - 1)]
+                        }
+                    };
+                    format!("min: {}, p50: {}, p99: {}, p999: {}, max: {}", f(p(0.0)), f(p(0.5)), f(p(0.99)), f(p(0.999)), f(p(1.0)))
+                }
+                metrics_util::debugging::DebugValue::Counter(v) => {
+                    format!("total: {}", v)
+                }
+                metrics_util::debugging::DebugValue::Gauge(v) => {
+                    format!("current: {}", f(*v))
+                }
+            };
+            println!("{} {}", key.name(), value_str);
+        }
+        println!("=======================");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snowflake_gateway_stress_test() -> anyhow::Result<()> {
+        if std::env::var("SNOWFLAKE_HOST").is_ok() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            recorder.install()?;
+
+            init_metrics();
+
+            let cancel_token = tokio_util::sync::CancellationToken::new();
+            {
+                let cancel_token = cancel_token.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(1));
+                    interval.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => {
+                                print_snapshot(snapshotter.snapshot());
+                                break;
+                            }
+                            _ = interval.tick() => {
+                                print_snapshot(snapshotter.snapshot());
+                            }
+                        }
+                    }
+
+                });
+            }
+            let _guard = cancel_token.drop_guard();
+
+            let config_map = serde_json::from_value(serde_json::json!({
+                "url": "snowflake://ENCRYPTED_STAGE_2",
+                "snowflake_stage": "ENCRYPTED_STAGE_2",
+                "max_retries": "3",
+                // "snowflake_stage_info_cache_ttl_secs": "0",
+                "snowflake_keyring_ttl_secs": "10000",
+                "snowflake_encryption_scheme": "AES_128_CBC"
+            }))?;
+
+            let client = Client::from_config_map(config_map).await?;
+
+            let n_files = 20_000;
+            let concurrency = 512;
+
+//             let t0 = std::time::Instant::now();
+//             futures_util::stream::iter(0..n_files)
+//                 .map(|i| {
+//                     let client = client.clone();
+//                     return tokio::spawn(async move {
+//                         let _ = client.put(&Path::from(format!("_blobs/{:08}.bin", i)), bytes::Bytes::new()).await.unwrap();
+//                     })
+//                 })
+//                 .buffer_unordered(64)
+//                 .for_each(|_| async {}).await;
+//             println!("{:?}", t0.elapsed());
+//
+//             let t0 = std::time::Instant::now();
+//             let list = client.list(&Path::from("_blobs"), None).await.unwrap();
+//             println!("{:?}", list.len());
+//             println!("{:?}", t0.elapsed());
+
+            let error_count = Arc::new(AtomicUsize::new(0));
+            let (tx, rx) = flume::unbounded::<usize>();
+
+            let mut tasks = vec![];
+            for _taskn in 0..concurrency {
+                let client = client.clone();
+                let error_count = error_count.clone();
+                let rx = rx.clone();
+                tasks.push(tokio::spawn(async move {
+                    loop {
+                        let i = match rx.recv_async().await {
+                            Ok(r) => r,
+                            _ => {
+                                break;
+                            }
+                        };
+
+                        let mut buf = [0; 10];
+                        let res = client.get(&Path::from(format!("_blobs/{:08}.bin", i)), &mut buf).await;
+                        if let Err(e) = res {
+                            if !format!("{e}").contains("Generic S3 error") {
+                                println!("failed with: {e}");
+                            }
+                            error_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        }
+                    }
+                }));
+            }
+
+            let t0 = std::time::Instant::now();
+            for _round in 0..10 {
+                for i in 0..n_files {
+                    tx.send_async(i).await?;
+                }
+            }
+            drop(tx);
+            drop(rx);
+
+            for task in tasks {
+                task.await?;
+            }
+            println!("{:?}", t0.elapsed());
+            println!("error_count {:?}", error_count);
+        } else {
+            println!("Ignoring test as it is not running on an SPCS service");
+            assert!(true);
+        }
+        Ok(())
+    }
+}

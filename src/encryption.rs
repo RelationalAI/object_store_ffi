@@ -24,8 +24,8 @@ pub(crate) trait CryptoMaterialProvider:
     + Sync
     + Debug
     + 'static {
-    async fn material_for_write(&self, path: &str, data_len: Option<usize>) -> anyhow::Result<(ContentCryptoMaterial, Attributes)>;
-    async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> anyhow::Result<ContentCryptoMaterial>;
+    async fn material_for_write(&self, path: &str, data_len: Option<usize>) -> crate::Result<(ContentCryptoMaterial, Attributes)>;
+    async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> crate::Result<ContentCryptoMaterial>;
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -665,7 +665,7 @@ impl<W> fmt::Debug for CrypterWriter<W> {
 
 #[async_trait::async_trait]
 impl<W: AsyncUpload + Send> AsyncUpload for CrypterWriter<W> {
-    async fn abort(&mut self) -> anyhow::Result<()> {
+    async fn abort(&mut self) -> crate::Result<()> {
         Ok(self.writer.abort().await?)
     }
 }

@@ -1,12 +1,12 @@
-use crate::{snowflake::SnowflakeClient, encryption::{CryptoMaterialProvider, CryptoScheme, ContentCryptoMaterial, Key, EncryptedKey, Iv}};
+use crate::{duration_on_drop, encryption::{ContentCryptoMaterial, CryptoMaterialProvider, CryptoScheme, EncryptedKey, Iv, Key}, error::{Error, ErrorExt}, metrics, snowflake::SnowflakeClient, util::deserialize_str};
+use crate::error::Kind as ErrorKind;
 
+use ::metrics::counter;
 use serde::{Serialize, Deserialize};
 use object_store::{Attributes, Attribute, AttributeValue};
-use anyhow::anyhow;
+use anyhow::Context;
 use moka::future::Cache;
 use std::sync::Arc;
-
-type ErrorMessage = String;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,21 +78,24 @@ impl SnowflakeStageKms {
 
 #[async_trait::async_trait]
 impl CryptoMaterialProvider for SnowflakeStageKms {
-    async fn material_for_write(&self, _path: &str, data_len: Option<usize>) -> anyhow::Result<(ContentCryptoMaterial, Attributes)> {
+    async fn material_for_write(&self, _path: &str, data_len: Option<usize>) -> crate::Result<(ContentCryptoMaterial, Attributes)> {
+        let _guard = duration_on_drop!(metrics::material_for_write_duration);
         let info = self.client.current_upload_info(&self.stage).await?;
 
         let encryption_material = info.encryption_material.as_ref()
-            .ok_or_else(|| anyhow!("stage `{}` not encrypted", self.stage))?;
+            .ok_or_else(|| ErrorKind::StorageNotEncrypted(self.stage.clone()))?;
         let description = MaterialDescription {
             smk_id: encryption_material.smk_id.to_string(),
             query_id: encryption_material.query_id.clone(),
             key_size: "128".to_string()
         };
-        let master_key = Key::from_base64(&encryption_material.query_stage_master_key)?;
+        let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
+            .map_err(ErrorKind::MaterialDecode)?;
 
         let scheme = self.config.crypto_scheme;
         let mut material = ContentCryptoMaterial::generate(scheme);
-        let encrypted_cek = material.cek.clone().encrypt_aes_128_ecb(&master_key)?;
+        let encrypted_cek = material.cek.clone().encrypt_aes_128_ecb(&master_key)
+            .map_err(ErrorKind::MaterialCrypt)?;
 
         let mut attributes = Attributes::new();
         attributes.insert(
@@ -111,7 +114,7 @@ impl CryptoMaterialProvider for SnowflakeStageKms {
         }
         attributes.insert(
             Attribute::Metadata("x-amz-matdesc".into()),
-            AttributeValue::from(serde_json::to_string(&description)?)
+            AttributeValue::from(serde_json::to_string(&description).context("failed to encode matdesc").to_err()?)
         );
 
         let cek_alg = match scheme {
@@ -131,35 +134,42 @@ impl CryptoMaterialProvider for SnowflakeStageKms {
         Ok((material, attributes))
     }
 
-    async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> anyhow::Result<ContentCryptoMaterial> {
+    async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> crate::Result<ContentCryptoMaterial> {
+        let _guard = duration_on_drop!(metrics::material_from_metadata_duration);
         let path = path.strip_prefix(&self.prefix).unwrap_or(path);
         let required_attribute = |key: &'static str| {
             let v: &str = attr.get(&Attribute::Metadata(key.into()))
-                .ok_or_else(|| anyhow!("missing required attribute `{}`", key))?
+                .ok_or_else(|| Error::required_config(format!("missing required attribute `{}`", key)))?
                 .as_ref();
-            Ok::<_, anyhow::Error>(v)
+            Ok::<_, Error>(v)
         };
 
 
-        let material_description: MaterialDescription = serde_json::from_str(required_attribute("x-amz-matdesc")?)?;
+        let material_description: MaterialDescription = deserialize_str(required_attribute("x-amz-matdesc")?)
+            .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
+
         let master_key = self.keyring.try_get_with(material_description.query_id, async {
-            let info = self.client.fetch_path_info(&self.stage, path).await
-                .map_err(|e| format!("failed to fetch path info: {}", e))?;
+            let info = self.client.fetch_path_info(&self.stage, path).await?;
             let position = info.src_locations.iter().position(|l| l == path)
-                .ok_or_else(|| "path not found")?;
+                .ok_or_else(|| Error::invalid_response("path not found"))?;
             let encryption_material = info.encryption_material.get(position)
                 .cloned()
-                .ok_or_else(|| "src locations and encryption material length mismatch")?
-                .ok_or_else(|| "path not encrypted")?;
+                .ok_or_else(|| Error::invalid_response("src locations and encryption material length mismatch"))?
+                .ok_or_else(|| Error::invalid_response("path not encrypted"))?;
 
             let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
-                .map_err(|e| format!("failed to decode qsmk base64: {}", e))?;
-            Ok::<_, ErrorMessage>(master_key)
-        }).await.map_err(|e| anyhow!(Arc::unwrap_or_clone(e)))?;
+                .map_err(ErrorKind::MaterialDecode)?;
+            counter!(metrics::total_keyring_miss).increment(1);
+            Ok::<_, Error>(master_key)
+        }).await?;
+        counter!(metrics::total_keyring_get).increment(1);
 
-        let cek = EncryptedKey::from_base64(required_attribute("x-amz-key")?)?;
-        let cek = cek.decrypt_aes_128_ecb(&master_key)?;
-        let iv = Iv::from_base64(required_attribute("x-amz-iv")?)?;
+        let cek = EncryptedKey::from_base64(required_attribute("x-amz-key")?)
+            .map_err(ErrorKind::MaterialDecode)?;
+        let cek = cek.decrypt_aes_128_ecb(&master_key)
+            .map_err(ErrorKind::MaterialCrypt)?;
+        let iv = Iv::from_base64(required_attribute("x-amz-iv")?)
+            .map_err(ErrorKind::MaterialDecode)?;
         let alg = required_attribute("x-amz-cek-alg");
 
         let scheme = match alg {
