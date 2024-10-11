@@ -647,6 +647,44 @@ macro_rules! export_queued_op {
     };
 }
 
+// TODO use macro for exporting runtime operations
+#[macro_export]
+macro_rules! export_runtime_op {
+    ($name: ident, $response: ty, $builder: expr, $state: ident, $asyncop: expr, $($v:ident: $t:ty),+) => {
+        #[no_mangle]
+        pub extern "C" fn $name(
+            $($v: $t),+,
+            response: *mut $response,
+            handle: *const c_void
+        ) -> CResult {
+            let response = unsafe { ResponseGuard::new(response, handle) };
+            let state_result: Result<_, anyhow::Error> = $builder();
+            let $state = match state_result {
+                Ok(s) => s,
+                Err(e) => {
+                    response.into_error(e);
+                    return CResult::Error;
+                }
+            };
+
+            match RT.get() {
+                Some(runtime) => {
+                    runtime.spawn(async move {
+                        let op = $asyncop;
+
+                        with_cancellation!(op, response);
+                    });
+                    CResult::Ok
+                }
+                None => {
+                    response.into_error("object_store_ffi runtime not started (may be missing initialization)");
+                    return CResult::Error;
+                }
+            }
+        }
+    };
+}
+
 trait NotifyGuard {
     fn is_uninitialized(&mut self) -> bool;
     fn condition_handle(&self) -> *const c_void;
