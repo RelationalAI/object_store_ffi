@@ -1,11 +1,13 @@
-use crate::{CResult, Client, RawConfig, NotifyGuard, SQ, static_config, Request, util::cstr_to_path, Context, RawResponse, ResponseGuard};
+use crate::{duration_on_drop, encryption::{encrypt, CrypterReader, CrypterWriter, Mode}, error::Kind as ErrorKind, export_queued_op, metrics, util::cstr_to_path, with_retries, BoxedReader, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, SQ};
 
+use bytes::Bytes;
+use ::metrics::counter;
 use object_store::{path::Path, ObjectStore};
 
-use anyhow::anyhow;
-use std::ffi::{c_char, c_void};
-use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
+use tokio_util::io::StreamReader;
+use std::{ffi::{c_char, c_void}, sync::Arc};
+use futures_util::{stream, StreamExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 // The type used to give Julia the result of an async request. It will be allocated
 // by Julia as part of the request and filled in by Rust.
@@ -42,206 +44,217 @@ impl RawResponse for Response {
     }
 }
 
-async fn multipart_get(slice: &mut [u8], path: &Path, client: &Client) -> anyhow::Result<usize> {
-    let result = client.store.head(&path).await?;
-    if result.size > slice.len() {
-        return Err(anyhow!("Supplied buffer was too small"));
-    }
-
-    let part_ranges = crate::util::size_to_ranges(result.size);
-
-    let result_vec = client.store.get_ranges(&path, &part_ranges).await?;
-    let mut accum: usize = 0;
-    for i in 0..result_vec.len() {
-        slice[accum..accum + result_vec[i].len()].copy_from_slice(&result_vec[i]);
-        accum += result_vec[i].len();
-    }
-
-    return Ok(accum);
-}
-
-async fn multipart_put(slice: &[u8], path: &Path, client: Client) -> anyhow::Result<()> {
-    let mut writer = object_store::buffered::BufWriter::with_capacity(
-        client.store,
-        path.clone(),
-        10 * 1024 * 1024
-    )
-        .with_max_concurrency(64);
-    match writer.write_all(slice).await {
-        Ok(_) => {
-            match writer.flush().await {
-                Ok(_) => {
-                    writer.shutdown().await?;
-                    return Ok(());
-                }
-                Err(e) => {
-                    writer.abort().await?;
-                    return Err(e.into());
-                }
-            }
-        }
-        Err(e) => {
-            writer.abort().await?;
-            return Err(e.into());
-        }
-    };
-}
-
-pub(crate) async fn handle_get(client: Client, slice: &mut [u8], path: &Path) -> anyhow::Result<usize> {
-    // Multipart Get
-    if slice.len() > static_config().multipart_get_threshold as usize {
-        let accum = multipart_get(slice, path, &client).await?;
-        return Ok(accum);
-    }
-
-    // Single part Get
-    let body = client.store.get(path).await?;
-    let mut batch_stream = body.into_stream().chunks(8);
-
+async fn read_to_slice(reader: &mut BoxedReader, mut slice: &mut [u8]) -> crate::Result<usize> {
     let mut received_bytes = 0;
-    while let Some(batch) = batch_stream.next().await {
-        for result in batch {
-            let chunk = match result {
-                Ok(c) => c,
-                Err(e) => {
-                    let err = anyhow::Error::new(e);
-                    tracing::warn!("Error while fetching a chunk: {:#}", err);
-                    return Err(err);
+    loop {
+        match reader.read_buf(&mut slice).await {
+            Ok(0) => {
+                if slice.len() == 0 {
+                    // TODO is there a better way to check for this?
+                    let mut scratch = [0u8; 1];
+                    if let Ok(0) = reader.read_buf(&mut scratch.as_mut_slice()).await {
+                        // slice was the exact size, done
+                        break;
+                    } else {
+                        return Err(ErrorKind::BufferTooSmall.into());
+                    }
+                } else {
+                    // done
+                    break;
                 }
-            };
-
-            let len = chunk.len();
-
-            if received_bytes + len > slice.len() {
-                return Err(anyhow!("Supplied buffer was too small"));
             }
-
-            slice[received_bytes..(received_bytes + len)].copy_from_slice(&chunk);
-            received_bytes += len;
+            Ok(n) => received_bytes += n,
+            Err(e) => {
+                let err = ErrorKind::BodyIo(e);
+                tracing::warn!("Error while reading body: {}", err);
+                return Err(err.into());
+            }
         }
     }
 
     Ok(received_bytes)
 }
 
-pub(crate) async fn handle_put(client: Client, slice: &'static [u8], path: &Path) -> anyhow::Result<usize> {
-    let len = slice.len();
-    if len < static_config().multipart_put_threshold as usize {
-        let _ = client.store.put(path, slice.into()).await?;
-    } else {
-        let _ = multipart_put(slice, path, client).await?;
+impl Client {
+    async fn get_impl(&self, path: &Path, slice: &mut [u8]) -> crate::Result<usize> {
+        let guard = duration_on_drop!(metrics::get_attempt_duration);
+        let path = &self.full_path(path);
+
+        // Multipart Get
+        if slice.len() > self.config.multipart_get_threshold {
+            guard.discard();
+            return self.multipart_get_impl(path, slice).await
+        }
+
+        // Single part Get
+        let result = self.store.get(path).await?;
+        let attributes = result.attributes.clone();
+
+        let mut reader: Box<dyn AsyncRead + Send + Unpin> = Box::new(StreamReader::new(result.into_stream()));
+
+        if let Some(cryptmp) = self.crypto_material_provider.as_ref() {
+            let material = cryptmp.material_from_metadata(path.as_ref(), &attributes).await?;
+            let decrypter_reader = CrypterReader::new(reader, Mode::Decrypt, &material)
+                .map_err(ErrorKind::ContentDecrypt)?;
+            reader = Box::new(decrypter_reader);
+        }
+
+        Ok(read_to_slice(&mut reader, slice).await?)
     }
-
-    Ok(len)
-}
-
-pub(crate) async fn handle_delete(client: Client, path: &Path) -> anyhow::Result<usize> {
-    client.store.delete(path).await?;
-
-    Ok(0)
-}
-
-#[no_mangle]
-pub extern "C" fn get(
-    path: *const c_char,
-    buffer: *mut u8,
-    size: usize,
-    config: *const RawConfig,
-    response: *mut Response,
-    handle: *const c_void
-) -> CResult {
-    let response = unsafe { ResponseGuard::new(response, handle) };
-    let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path = unsafe{ cstr_to_path(path) };
-    let slice = unsafe { std::slice::from_raw_parts_mut(buffer, size) };
-    let config = unsafe { & (*config) };
-    match SQ.get() {
-        Some(sq) => {
-            match sq.try_send(Request::Get(path, slice, config, response)) {
-                Ok(_) => CResult::Ok,
-                Err(flume::TrySendError::Full(Request::Get(_, _, _, response))) => {
-                    response.into_error("object_store_ffi internal channel full, backoff");
-                    CResult::Backoff
-                }
-                Err(flume::TrySendError::Disconnected(Request::Get(_, _, _, response))) => {
-                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-                    CResult::Error
-                }
-                _ => unreachable!("the response type must match")
+    pub async fn get(&self, path: &Path, slice: &mut [u8]) -> crate::Result<usize> {
+        counter!(metrics::total_get_ops).increment(1);
+        with_retries!(self, self.get_impl(path, slice).await)
+    }
+    async fn put_impl(&self, path: &Path, slice: Bytes) -> crate::Result<usize> {
+        let guard = duration_on_drop!(metrics::put_attempt_duration);
+        let path = &self.full_path(path);
+        let len = slice.len();
+        if len < self.config.multipart_put_threshold {
+            if let Some(cryptmp) = self.crypto_material_provider.as_ref() {
+                let (material, attrs) = cryptmp.material_for_write(path.as_ref(), Some(slice.len())).await?;
+                let ciphertext = if slice.is_empty() {
+                    // Do not write any padding if there was no data
+                    vec![]
+                } else {
+                    encrypt(&slice, &material)
+                        .map_err(ErrorKind::ContentEncrypt)?
+                };
+                let _ = self.store.put_opts(
+                    path,
+                    ciphertext.into(),
+                    attrs.into()
+                ).await?;
+            } else {
+                let _ = self.store.put(path, slice.into()).await?;
             }
+        } else {
+            guard.discard();
+            return self.multipart_put_impl(path, &slice).await;
         }
-        None => {
-            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-            return CResult::Error;
+
+        Ok(len)
+    }
+    pub async fn put(&self, path: &Path, slice: Bytes) -> crate::Result<usize> {
+        counter!(metrics::total_put_ops).increment(1);
+        with_retries!(self, self.put_impl(path, slice.clone()).await)
+    }
+    async fn delete_impl(&self, path: &Path) -> crate::Result<usize> {
+        let _guard = duration_on_drop!(metrics::delete_attempt_duration);
+        let path = &self.full_path(path);
+        self.store.delete(path).await?;
+        Ok(0)
+    }
+    pub async fn delete(&self, path: &Path) -> crate::Result<usize> {
+        counter!(metrics::total_delete_ops).increment(1);
+        with_retries!(self, self.delete_impl(path).await)
+    }
+    async fn multipart_get_impl(&self, path: &Path, slice: &mut [u8]) -> crate::Result<usize> {
+        let _guard = duration_on_drop!(metrics::multipart_get_attempt_duration);
+        let result = self.store.get_opts(
+            &path,
+            object_store::GetOptions {
+                head: true,
+                ..Default::default()
+            }
+        ).await?;
+
+        let part_ranges = crate::util::size_to_ranges(result.meta.size, self.config.multipart_get_part_size);
+        let result_vec = self.store.get_ranges(&path, &part_ranges).await?;
+        let mut reader: BoxedReader = Box::new(StreamReader::new(stream::iter(result_vec).map(|b| Ok::<_, std::io::Error>(b))));
+
+        if let Some(cryptmp) = self.crypto_material_provider.as_ref() {
+            let material = cryptmp.material_from_metadata(path.as_ref(), &result.attributes).await?;
+            let decrypter_reader = CrypterReader::new(reader, Mode::Decrypt, &material)
+                .map_err(ErrorKind::ContentDecrypt)?;
+            reader = Box::new(decrypter_reader);
         }
+
+        Ok(read_to_slice(&mut reader, slice).await?)
+    }
+    pub async fn multipart_get(&self, path: &Path, slice: &mut [u8]) -> crate::Result<usize> {
+        with_retries!(self, self.multipart_get_impl(path, slice).await)
+    }
+    async fn multipart_put_impl(&self, path: &Path, slice: &[u8]) -> crate::Result<usize> {
+        let _guard = duration_on_drop!(metrics::multipart_put_attempt_duration);
+        let mut writer: BoxedUpload = if let Some(cryptmp) = self.crypto_material_provider.as_ref() {
+            let (material, attrs) = cryptmp.material_for_write(path.as_ref(), Some(slice.len())).await?;
+            let writer = object_store::buffered::BufWriter::with_capacity(
+                Arc::clone(&self.store),
+                path.clone(),
+                self.config.multipart_put_part_size
+            )
+                .with_attributes(attrs)
+                .with_max_concurrency(self.config.multipart_put_concurrency);
+            let encrypter_writer = CrypterWriter::new(writer, Mode::Encrypt, &material)
+                .map_err(ErrorKind::ContentEncrypt)?;
+            Box::new(encrypter_writer)
+        } else {
+            Box::new(
+                object_store::buffered::BufWriter::with_capacity(
+                    Arc::clone(&self.store),
+                    path.clone(),
+                    self.config.multipart_put_part_size
+                )
+                .with_max_concurrency(self.config.multipart_put_concurrency)
+            )
+        };
+
+        match writer.write_all(slice).await {
+            Ok(_) => {
+                match writer.flush().await {
+                    Ok(_) => {
+                        writer.shutdown().await
+                            .map_err(ErrorKind::BodyIo)?;
+                        return Ok(slice.len());
+                    }
+                    Err(e) => {
+                        writer.abort().await?;
+                        return Err(ErrorKind::BodyIo(e).into());
+                    }
+                }
+            }
+            Err(e) => {
+                writer.abort().await?;
+                return Err(ErrorKind::BodyIo(e).into());
+            }
+        };
+    }
+    pub async fn multipart_put(&self, path: &Path, slice: &[u8]) -> crate::Result<usize> {
+        with_retries!(self, self.multipart_put_impl(path, slice).await)
     }
 }
 
-#[no_mangle]
-pub extern "C" fn put(
-    path: *const c_char,
-    buffer: *const u8,
-    size: usize,
-    config: *const RawConfig,
-    response: *mut Response,
-    handle: *const c_void
-) -> CResult {
-    let response = unsafe { ResponseGuard::new(response, handle) };
-    let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path = unsafe{ cstr_to_path(path) };
-    let slice = unsafe { std::slice::from_raw_parts(buffer, size) };
-    let config = unsafe { & (*config) };
-    match SQ.get() {
-        Some(sq) => {
-            match sq.try_send(Request::Put(path, slice, config, response)) {
-                Ok(_) => CResult::Ok,
-                Err(flume::TrySendError::Full(Request::Put(_, _, _, response))) => {
-                    response.into_error("object_store_ffi internal channel full, backoff");
-                    CResult::Backoff
-                }
-                Err(flume::TrySendError::Disconnected(Request::Put(_, _, _, response))) => {
-                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-                    CResult::Error
-                }
-                _ => unreachable!("the response type must match")
-            }
-        }
-        None => {
-            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-            return CResult::Error;
-        }
-    }
-}
+export_queued_op!(
+    get,
+    Response,
+    |config, response| {
+        let path = unsafe { std::ffi::CStr::from_ptr(path) };
+        let path = unsafe{ cstr_to_path(path) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(buffer, size) };
+        Ok(Request::Get(path, slice, config, response))
+    },
+    path: *const c_char, buffer: *mut u8, size: usize
+);
 
-#[no_mangle]
-pub extern "C" fn delete(
-    path: *const c_char,
-    config: *const RawConfig,
-    response: *mut Response,
-    handle: *const c_void
-) -> CResult {
-    let response = unsafe { ResponseGuard::new(response, handle) };
-    let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    let path = unsafe{ cstr_to_path(path) };
-    let config = unsafe { & (*config) };
-    match SQ.get() {
-        Some(sq) => {
-            match sq.try_send(Request::Delete(path, config, response)) {
-                Ok(_) => CResult::Ok,
-                Err(flume::TrySendError::Full(Request::Delete(_, _, response))) => {
-                    response.into_error("object_store_ffi internal channel full, backoff");
-                    CResult::Backoff
-                }
-                Err(flume::TrySendError::Disconnected(Request::Delete(_, _, response))) => {
-                    response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-                    CResult::Error
-                }
-                _ => unreachable!("the response type must match")
-            }
-        }
-        None => {
-            response.into_error("object_store_ffi internal channel closed (may be missing initialization)");
-            return CResult::Error;
-        }
-    }
-}
+export_queued_op!(
+    put,
+    Response,
+    |config, response| {
+        let path = unsafe { std::ffi::CStr::from_ptr(path) };
+        let path = unsafe{ cstr_to_path(path) };
+        let slice = unsafe { std::slice::from_raw_parts(buffer, size) };
+        Ok(Request::Put(path, slice, config, response))
+    },
+    path: *const c_char, buffer: *const u8, size: usize
+);
+
+export_queued_op!(
+    delete,
+    Response,
+    |config, response| {
+        let path = unsafe { std::ffi::CStr::from_ptr(path) };
+        let path = unsafe{ cstr_to_path(path) };
+        Ok(Request::Delete(path, config, response))
+    },
+    path: *const c_char
+);

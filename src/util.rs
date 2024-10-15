@@ -1,17 +1,13 @@
-use crate::static_config;
-
 use std::ops::Range;
 use std::ffi::c_char;
 use anyhow::anyhow;
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncBufRead, AsyncWrite};
 
-pub(crate) fn size_to_ranges(object_size: usize) -> Vec<Range<usize>> {
+pub(crate) fn size_to_ranges(object_size: usize, part_size: usize) -> Vec<Range<usize>> {
     if object_size == 0 {
         return vec![];
     }
-
-    let part_size: usize = static_config().multipart_get_part_size as usize;
 
     // If the object size happens to be smaller than part_size,
     // then we will end up doing a single range get of the whole
@@ -60,6 +56,18 @@ impl TryFrom<*const c_char> for Compression {
     }
 }
 
+#[async_trait::async_trait]
+pub(crate) trait AsyncUpload: AsyncWrite {
+    async fn abort(&mut self) -> crate::Result<()>;
+}
+
+#[async_trait::async_trait]
+impl AsyncUpload for object_store::buffered::BufWriter {
+    async fn abort(&mut self) -> crate::Result<()> {
+        Ok(object_store::buffered::BufWriter::abort(self).await?)
+    }
+}
+
 #[derive(Debug)]
 #[pin_project(project = EncoderProj)]
 pub(crate) enum Encoder<T: AsyncWrite> {
@@ -101,8 +109,24 @@ impl<T: AsyncWrite> CompressedWriter<T> {
     }
 }
 
-impl CompressedWriter<object_store::buffered::BufWriter> {
-    pub(crate) async fn abort(&mut self) -> anyhow::Result<()> {
+#[async_trait::async_trait]
+impl<T: AsyncUpload + Send> AsyncUpload for CompressedWriter<T> {
+    async fn abort(&mut self) -> crate::Result<()> {
+        let writer = match &mut self.encoder {
+            Encoder::None(e) => e,
+            Encoder::Gzip(e) => e.get_mut(),
+            Encoder::Deflate(e) => e.get_mut(),
+            Encoder::Zlib(e) => e.get_mut(),
+            Encoder::Zstd(e) => e.get_mut(),
+        };
+
+        Ok(writer.abort().await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncUpload for CompressedWriter<Box<dyn AsyncUpload + Send + Unpin>> {
+    async fn abort(&mut self) -> crate::Result<()> {
         let writer = match &mut self.encoder {
             Encoder::None(e) => e,
             Encoder::Gzip(e) => e.get_mut(),
@@ -210,4 +234,29 @@ pub(crate) unsafe fn cstr_to_path(cstr: &std::ffi::CStr) -> object_store::path::
 
     let path: object_store::path::Path = std::mem::transmute(raw_path);
     return path;
+}
+
+pub(crate) unsafe fn string_to_path(string: String) -> object_store::path::Path {
+    let raw_path = RawPath {
+        raw: string
+    };
+
+    let path: object_store::path::Path = std::mem::transmute(raw_path);
+    return path;
+}
+
+pub(crate) fn deserialize_slice<'a, T>(v: &'a [u8]) -> Result<T, serde_path_to_error::Error<serde_json::Error>>
+where
+    T: serde::Deserialize<'a>,
+{
+    let de = &mut serde_json::Deserializer::from_slice(v);
+    serde_path_to_error::deserialize(de)
+}
+
+pub(crate) fn deserialize_str<'a, T>(v: &'a str) -> Result<T, serde_path_to_error::Error<serde_json::Error>>
+where
+    T: serde::Deserialize<'a>,
+{
+    let de = &mut serde_json::Deserializer::from_str(v);
+    serde_path_to_error::deserialize(de)
 }
