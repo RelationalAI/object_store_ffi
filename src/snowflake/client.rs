@@ -573,21 +573,21 @@ impl SnowflakeClient {
         }
     }
     pub(crate) async fn fetch_upload_info(&self, stage: impl AsRef<str>) -> crate::Result<SnowflakeUploadData> {
-        counter!("total_fetch_upload_info").increment(1);
         let _guard = duration_on_drop!(metrics::sf_fetch_upload_info_retried_duration);
         let upload_data: SnowflakeUploadData = self
             .query(format!("PUT file:///tmp/whatever @{}", stage.as_ref()))
             .await?;
 
+        counter!(metrics::total_fetch_upload_info).increment(1);
         Ok(upload_data)
     }
     pub(crate) async fn fetch_path_info(&self, stage: impl AsRef<str>, path: impl AsRef<str>) -> crate::Result<SnowflakeDownloadData> {
-        counter!("total_fetch_path_info").increment(1);
         let _guard = duration_on_drop!(metrics::sf_fetch_path_info_retried_duration);
         let download_data: SnowflakeDownloadData = self
             .query(format!("GET @{}/{} file:///tmp/whatever", stage.as_ref(), path.as_ref()))
             .await?;
 
+        counter!(metrics::total_fetch_path_info).increment(1);
         Ok(download_data)
     }
     #[allow(unused)]

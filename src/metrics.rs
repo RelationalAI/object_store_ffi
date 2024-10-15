@@ -31,6 +31,8 @@ metric_const!(total_put_ops);
 metric_const!(total_delete_ops);
 metric_const!(total_keyring_get);
 metric_const!(total_keyring_miss);
+metric_const!(total_fetch_upload_info);
+metric_const!(total_fetch_path_info);
 
 #[allow(dead_code)]
 pub fn init_metrics() {
