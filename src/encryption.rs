@@ -257,6 +257,21 @@ pub(crate) fn decrypt(
     }
 }
 
+// This implementation consists of a Buffer that has three contiguous regions: the consumed
+// region, the filled region and the unfilled region. The buffer starts completely unfilled and
+// its state is modified by calling:
+// - advance: to indicate that useful data has been writen to the buffer, increasing the filled
+// region (over the unfilled one)
+// - consume: to indicate that useful data has been processed out of the buffer, incresing the
+// consumed region (over the filled one)
+// - compact: moves any bytes of the filled region to the start of the buffer, reseting the
+// consumed and unfilled regions accordingly
+// - clear: resets everything to the initial state
+//
+//     consume ==>|   advance ==>|
+// +--------------+--------------+----------+
+// |   consumed   |    filled    | unfilled |
+// +--------------+--------------+----------+
 struct Buffer {
     buf: Vec<u8>,
     pos: usize,
@@ -385,6 +400,8 @@ enum State {
     Done,
 }
 
+// Asynchronous reader that transparently en/decrypts data on reads.
+// It is capable of dealing with both AES CBC and AES GCM.
 #[pin_project]
 pub struct CrypterReader<R> {
     #[pin]
@@ -636,6 +653,8 @@ impl<R: AsyncRead> AsyncRead for CrypterReader<R> {
     }
 }
 
+// Asynchronous writer that transparently en/decrypts data on write.
+// It is capable of dealing with both AES CBC and AES GCM.
 #[pin_project]
 pub struct CrypterWriter<W> {
     #[pin]
