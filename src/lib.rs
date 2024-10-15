@@ -22,7 +22,8 @@ use object_store::{path::Path, ObjectStore};
 use moka::future::Cache;
 
 mod util;
-use util::{deserialize_str, string_to_path, AsyncUpload, Compression};
+use util::{deserialize_str, string_to_path, AsyncUpload};
+pub use util::Compression;
 
 mod error;
 pub(crate) use error::Result;
@@ -371,7 +372,7 @@ impl Client {
     async fn from_raw_config(config: &RawConfig) -> crate::Result<Client> {
         Ok(Client::from_config_map(config.as_map()?).await?)
     }
-    async fn from_config_map(mut map: HashMap<String, String>) -> crate::Result<Client> {
+    pub async fn from_config_map(mut map: HashMap<String, String>) -> crate::Result<Client> {
         let url = map.remove("url")
             .ok_or(Error::invalid_config("config object must have a key named 'url'"))?;
 

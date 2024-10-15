@@ -1,17 +1,20 @@
 use crate::encryption::{CrypterReader, CrypterWriter, Mode};
 use crate::{destroy_with_runtime, export_queued_op, with_retries, BoxedReader, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
 use crate::util::{size_to_ranges, Compression, CompressedWriter, with_decoder, cstr_to_path};
-use crate::error::{Kind as ErrorKind, RetryState};
+use crate::error::{Error, ErrorExt, Kind as ErrorKind, RetryState};
 use crate::with_cancellation;
 
+use anyhow::Context as AnyhowContext;
 use object_store::{path::Path, ObjectStore};
 
 use bytes::Buf;
 use tokio_util::io::StreamReader;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use walkdir::WalkDir;
 use std::ffi::{c_char, c_void, c_longlong};
 use std::sync::Arc;
 use futures_util::{StreamExt, TryStreamExt};
+use std::path::Path as OsPath;
 
 impl Client {
     async fn put_stream_impl(&self, path: &Path, compression: Compression) -> crate::Result<BoxedUpload> {
@@ -112,6 +115,95 @@ impl Client {
     }
     pub(crate) async fn get_stream(&self, path: &Path, size_hint: usize, compression: Compression) -> crate::Result<BoxedReader> {
         with_retries!(self, self.get_stream_impl(path, size_hint, compression).await)
+    }
+    pub(crate) async fn download_impl(&self, remote_path: &Path, local_path: &OsPath, compression: Compression) -> crate::Result<usize> {
+        let mut writer = tokio::fs::File::create(local_path).await
+            .context("failed to open file to download").to_err()?;
+        let mut reader = self.get_stream_impl(remote_path, 0, compression).await?;
+        let bytes = tokio::io::copy(&mut reader, &mut writer).await
+            .context("failed to stream bytes from storage to file").to_err()?;
+        writer.shutdown().await
+            .context("failed to complete download").to_err()?;
+        Ok(bytes as usize)
+    }
+    pub async fn download(&self, remote_path: &Path, local_path: &OsPath, compression: Compression) -> crate::Result<usize> {
+        with_retries!(self, self.download_impl(remote_path, local_path, compression).await)
+    }
+    pub(crate) async fn download_prefix_impl(&self, remote_prefix: &Path, local_directory: &OsPath, compression: Compression) -> crate::Result<usize> {
+        let values: Vec<_> = self.list_stream_impl(remote_prefix, None).await?
+            .flat_map(|c| futures_util::stream::iter(c))
+            .map(|result| {
+                let client = self.clone();
+                let local_directory = local_directory.to_path_buf();
+                async move {
+                    return tokio::spawn(async move {
+                        let meta = result?;
+                        let filename_str = meta.location.filename()
+                            .ok_or_else(|| Error::invalid_response("Unable to determine the filename for remote path"))?;
+                        let local_path = local_directory.join(filename_str);
+                        client.download_impl(&meta.location, &local_path, compression).await?;
+                        Ok::<_, crate::error::Error>(())
+                    }).await?;
+                }
+            })
+            .buffer_unordered(32)
+            .try_collect().await?;
+        Ok(values.len())
+    }
+    pub async fn download_prefix(&self, remote_prefix: &Path, local_directory: &OsPath, compression: Compression) -> crate::Result<usize> {
+        with_retries!(self, self.download_prefix_impl(remote_prefix, local_directory, compression).await)
+    }
+    pub(crate) async fn upload_impl(&self, local_path: &OsPath, remote_path: &Path, compression: Compression) -> crate::Result<usize> {
+        let mut reader = tokio::fs::File::open(local_path).await
+            .context("failed to open file to upload").to_err()?;
+        let mut writer = self.put_stream_impl(remote_path, compression).await?;
+        let bytes = tokio::io::copy(&mut reader, &mut writer).await
+            .context("failed to stream bytes from file to storage").to_err()?;
+        writer.shutdown().await
+            .context("failed to complete upload").to_err()?;
+        Ok(bytes as usize)
+    }
+    pub async fn upload(&self, local_path: &OsPath, remote_path: &Path, compression: Compression) -> crate::Result<usize> {
+        with_retries!(self, self.upload_impl(local_path, remote_path, compression).await)
+    }
+    pub(crate) async fn upload_directory_impl(&self, local_directory: &OsPath, remote_prefix: &Path, compression: Compression) -> crate::Result<usize> {
+        let mut uploads = vec![];
+        for entry in WalkDir::new(local_directory) {
+            let entry = entry
+                .context("failed to list directory")
+                .to_err()?;
+            let path = entry.path();
+            if path.is_file() {
+                let relative_path = path
+                        .strip_prefix(local_directory)
+                        .context("failed to get relative path for file")
+                        .to_err()?;
+                let remote_path = OsPath::new(remote_prefix.as_ref()).join(relative_path);
+                let remote_path = Path::from(remote_path.to_str().context("invalid utf8").to_err()?);
+                let local_path = path;
+                uploads.push((local_path.to_path_buf(), remote_path, compression));
+            }
+        }
+
+        let count = uploads.len();
+
+        futures_util::stream::iter(uploads)
+            .map(|(local_path, remote_path, compression)| {
+                let client = self.clone();
+                async move {
+                    return tokio::spawn(async move {
+                        client.upload_impl(&local_path, &remote_path, compression).await?;
+                        Ok::<_, crate::error::Error>(())
+                    }).await?;
+                }
+            })
+            .buffer_unordered(32)
+            .try_collect().await?;
+
+        Ok(count)
+    }
+    pub async fn upload_directory(&self, local_directory: &OsPath, remote_prefix: &Path, compression: Compression) -> crate::Result<usize> {
+        with_retries!(self, self.upload_directory_impl(local_directory, remote_prefix, compression).await)
     }
 }
 
