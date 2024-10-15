@@ -270,6 +270,13 @@ impl Kind {
                         retries,
                         reason: ErrorReason::Timeout
                     }
+                } else if e.kind() == std::io::ErrorKind::NotFound {
+                    if e.source().is_some() { continue; }
+                    // Do not retry root NotFound
+                    return ErrorInfo {
+                        retries,
+                        reason: ErrorReason::Unknown
+                    }
                 } else if e.kind() == std::io::ErrorKind::Other && e.source().is_some() {
                     // Continue to source error
                     continue

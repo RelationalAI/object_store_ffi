@@ -839,8 +839,11 @@ impl<W: AsyncWrite> AsyncWrite for CrypterWriter<W> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use rand::Rng;
 
     #[tokio::test]
     async fn crypter_reader_aes_cbc_round_trip() {
@@ -1017,5 +1020,176 @@ mod tests {
         let plaintext = decrypt(&ciphertext, &material).unwrap();
 
         assert_eq!(data, plaintext);
+    }
+
+    async fn random_crypter_writer_writes(
+        data: &[u8],
+        mode: Mode,
+        material: &ContentCryptoMaterial,
+        max_write_size: usize,
+        flush_prob: f64
+    ) -> Vec<u8> {
+        let mut result = vec![];
+        let mut writer = CrypterWriter::new(&mut result, mode, &material).unwrap();
+        let mut offset = 0;
+        loop {
+            let remaining = data.len() - offset;
+            assert!(remaining >= 1);
+            let upper_bound = remaining.min(max_write_size);
+            let write_size = if upper_bound == 1 {
+                1
+            } else {
+                rand::thread_rng().gen_range(1..upper_bound)
+            };
+            let write_end_offset = offset + write_size;
+            loop {
+                offset += writer.write(&data[offset..write_end_offset]).await.unwrap();
+                if offset == write_end_offset { break; }
+            }
+            assert!(offset <= data.len());
+            if offset == data.len() {
+                break;
+            }
+            if rand::thread_rng().gen::<f64>() <= flush_prob {
+                writer.flush().await.unwrap();
+            }
+        }
+        writer.flush().await.unwrap();
+        writer.shutdown().await.unwrap();
+        result
+    }
+
+    async fn random_crypter_reader_reads(
+        data: &[u8],
+        mode: Mode,
+        material: &ContentCryptoMaterial,
+        max_read_size: usize
+    ) -> Vec<u8> {
+        let mut result = vec![0; data.len() + material.scheme.cipher().block_size() + material.scheme.tag_len()];
+        let mut reader = CrypterReader::new(Cursor::new(data), mode, &material).unwrap();
+        let mut offset = 0;
+        loop {
+            let remaining = result.len() - offset;
+            if remaining == 0 {
+                let mut scratch = [0u8; 1];
+                if let Ok(0) = reader.read(scratch.as_mut_slice()).await {
+                    break;
+                } else {
+                    panic!("needs to read past result len");
+                }
+            }
+            assert!(remaining >= 1);
+            let upper_bound = remaining.min(max_read_size);
+            let read_size = if upper_bound == 1 {
+                1
+            } else {
+                rand::thread_rng().gen_range(1..upper_bound)
+            };
+            let n = reader.read(&mut result[offset..(offset + read_size)]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            offset += n;
+            assert!(offset <= result.len());
+        }
+        result.truncate(offset);
+        result
+    }
+
+    fn compare_large_slices(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            eprintln!("expected lengths {} and {} to match", a.len(), b.len());
+            return false;
+        }
+
+        for i in 0..a.len() {
+            let i_a = a[i];
+            let i_b = b[i];
+            if i_a != i_b {
+                eprintln!("expected datum {} and {} to match at index {i}", i_a, i_b);
+                let preceding_range = i.saturating_sub(10)..i;
+                let succeding_range = i..i.saturating_add(10).min(a.len());
+                eprintln!("expected preceding: {:?} and succeding {:?}", &a[preceding_range.clone()], &b[preceding_range]);
+                eprintln!("received preceding: {:?} and succeding {:?}", &a[succeding_range.clone()], &b[succeding_range]);
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[tokio::test]
+    async fn randomized_crypter_writer_aes_cbc() {
+        let size = 500 * 1024 * 1024;
+        let max_write_size = 20 * 1024 * 1024;
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes128Cbc);
+        let data: Vec<u8> = (0..size).map(|n| (n % 256) as u8).collect();
+
+        for _i in 0..50 {
+            let ciphertext = random_crypter_writer_writes(&data, Mode::Encrypt, &material, max_write_size, 0.1).await;
+
+            let plaintext = decrypt(&ciphertext, &material).unwrap();
+            assert!(compare_large_slices(&data, &plaintext));
+
+            let plaintext = random_crypter_writer_writes(&ciphertext, Mode::Decrypt, &material, max_write_size, 0.1).await;
+            assert!(compare_large_slices(&data, &plaintext));
+        }
+    }
+
+    #[tokio::test]
+    async fn randomized_crypter_reader_aes_cbc() {
+        let size = 500 * 1024 * 1024;
+        let max_read_size = 20 * 1024 * 1024;
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes128Cbc);
+        let data: Vec<u8> = (0..size).map(|n| (n % 256) as u8).collect();
+
+        for _i in 0..50 {
+            let ciphertext = random_crypter_reader_reads(&data, Mode::Encrypt, &material, max_read_size).await;
+
+            let plaintext = decrypt(&ciphertext, &material).unwrap();
+            assert!(compare_large_slices(&data, &plaintext));
+
+            let plaintext = random_crypter_reader_reads(&ciphertext, Mode::Decrypt, &material, max_read_size).await;
+            assert!(compare_large_slices(&data, &plaintext));
+        }
+    }
+    #[tokio::test]
+    async fn randomized_crypter_writer_aes_gcm() {
+        let size = 100 * 1024 * 1024;
+        let max_write_size = 20 * 1024 * 1024;
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes256Gcm);
+        let data: Vec<u8> = (0..size).map(|n| (n % 256) as u8).collect();
+
+        for _i in 0..50 {
+            let ciphertext = random_crypter_writer_writes(&data, Mode::Encrypt, &material, max_write_size, 0.1).await;
+
+            let plaintext = decrypt(&ciphertext, &material).unwrap();
+            assert!(compare_large_slices(&data, &plaintext));
+
+            let plaintext = random_crypter_writer_writes(&ciphertext, Mode::Decrypt, &material, max_write_size, 0.1).await;
+            assert!(compare_large_slices(&data, &plaintext));
+        }
+    }
+
+    #[tokio::test]
+    async fn randomized_crypter_reader_aes_gcm() {
+        let size = 100 * 1024 * 1024;
+        let max_read_size = 20 * 1024 * 1024;
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes256Gcm)
+            .with_aad("AES/GCM/NoPadding");
+        let data: Vec<u8> = (0..size).map(|n| (n % 256) as u8).collect();
+
+        for _i in 0..50 {
+            let ciphertext = random_crypter_reader_reads(&data, Mode::Encrypt, &material, max_read_size).await;
+
+            let ciphertext2 = encrypt(&data, &material).unwrap();
+            assert!(compare_large_slices(&ciphertext, &ciphertext2));
+
+            let plaintext = decrypt(&ciphertext, &material).unwrap();
+            assert!(compare_large_slices(&data, &plaintext));
+
+            let plaintext = random_crypter_reader_reads(&ciphertext, Mode::Decrypt, &material, max_read_size).await;
+            assert!(compare_large_slices(&data, &plaintext));
+        }
     }
 }
