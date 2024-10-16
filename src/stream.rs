@@ -342,7 +342,9 @@ pub extern "C" fn read_from_stream(
                     let mut bytes_read = 0;
                     while amount_to_read > bytes_read {
                         let len = slice.len();
-                        let n = wrapper.reader.read_buf(&mut slice).await?;
+                        let n = wrapper.reader.read_buf(&mut slice).await
+                            .context("failed to read from stream")
+                            .to_err()?;
 
                         if n == 0 {
                             if len == 0 {
@@ -356,7 +358,7 @@ pub extern "C" fn read_from_stream(
                         }
                     }
 
-                    Ok::<_, anyhow::Error>((bytes_read, false))
+                    Ok::<_, Error>((bytes_read, false))
                 };
 
                 with_cancellation!(read_op, response);
@@ -416,8 +418,8 @@ pub extern "C" fn is_end_of_stream(
                         } else {
                             (buffer.len(), false)
                         }
-                    })?;
-                    Ok::<_, anyhow::Error>((bytes_read, eof))
+                    }).context("failed to fill stream buffer").to_err()?;
+                    Ok::<_, Error>((bytes_read, eof))
                 };
 
                 with_cancellation!(eof_op, response);
@@ -581,12 +583,14 @@ pub extern "C" fn write_to_stream(
                     let write_op = async {
                         let mut bytes_written = 0;
                         while slice.has_remaining() {
-                            bytes_written += wrapper.writer.write_buf(&mut slice).await?;
+                            bytes_written += wrapper.writer.write_buf(&mut slice).await
+                                .context("failed to write to stream").to_err()?;
                         }
                         if flush {
-                            wrapper.writer.flush().await?;
+                            wrapper.writer.flush().await
+                                .context("failed to flush stream buffer").to_err()?;
                         }
-                        Ok::<_, anyhow::Error>(bytes_written)
+                        Ok::<_, Error>(bytes_written)
                     };
                     match write_op.await {
                         Ok(r) => Ok(r),
@@ -636,8 +640,10 @@ pub extern "C" fn shutdown_write_stream(
         Some(runtime) => {
             runtime.spawn(async move {
                 let shutdown_op = async {
-                    wrapper.writer.shutdown().await?;
-                    Ok::<_, anyhow::Error>(0usize)
+                    wrapper.writer.shutdown().await
+                        .context("failed to shutdown stream")
+                        .to_err()?;
+                    Ok::<_, Error>(0usize)
                 };
 
                 // Manual cancellation due to cleanup
