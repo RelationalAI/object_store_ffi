@@ -56,8 +56,7 @@ mod sfcp {
         Ok(client)
     }
 
-    #[tokio::main]
-    async fn main() -> anyhow::Result<()> {
+    pub(crate) async fn main() -> anyhow::Result<()> {
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::EnvFilter::try_from_default_env()
