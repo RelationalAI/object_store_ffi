@@ -90,7 +90,7 @@ jobs:
         id: copy
         shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/sfcp sfcp
+          cp target/${{ matrix.target }}/release-no-debug/sfcp sfcp
           echo "path=sfcp" >> $GITHUB_OUTPUT
       - env:
           GH_TOKEN: ${{ github.token }}
