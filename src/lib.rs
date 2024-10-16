@@ -686,6 +686,29 @@ macro_rules! export_runtime_op {
     };
 }
 
+export_runtime_op!(
+    invalidate_config,
+    Response,
+    || {
+        let config = if config.is_null() {
+            None
+        } else {
+            Some(unsafe { & (*config) })
+        };
+        Ok(config)
+    },
+    config,
+    async {
+        if let Some(config) = config {
+            clients().invalidate(&config.get_hash()).await;
+        } else {
+            clients().invalidate_all();
+        }
+        Ok::<_, Error>(0usize)
+    },
+    config: *const RawConfig
+);
+
 trait NotifyGuard {
     fn is_uninitialized(&mut self) -> bool;
     fn condition_handle(&self) -> *const c_void;
