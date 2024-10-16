@@ -22,7 +22,11 @@ bench = false
 
 # https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.release]
-debug = true
+debug = 1
+
+[profile.release-no-debug]
+inherits = "release"
+strip = "debuginfo"
 
 [features]
 default = ["julia"]

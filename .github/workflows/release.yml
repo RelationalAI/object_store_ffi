@@ -85,7 +85,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: ${{ matrix.prebuild }}
-      - run: ${{ matrix.command }} build --release --target ${{ matrix.target }} --bin sfcp --features sfcp,openssl/vendored
+      - run: ${{ matrix.command }} build --profile release-no-debug --target ${{ matrix.target }} --bin sfcp --features sfcp,openssl/vendored
       - name: Copy and Output
         id: copy
         shell: bash
