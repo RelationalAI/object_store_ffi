@@ -105,7 +105,7 @@ impl Client {
     pub(crate) async fn list(&self, path: &Path, offset: Option<&Path>) -> crate::Result<Vec<ObjectMeta>> {
         with_retries!(self, self.list_impl(path, offset).await)
     }
-    async fn list_stream_impl(&self, prefix: &Path, offset: Option<&Path>) -> crate::Result<ListStream> {
+    pub(crate) async fn list_stream_impl(&self, prefix: &Path, offset: Option<&Path>) -> crate::Result<ListStream> {
         let prefix = &self.full_path(prefix);
         let offset = offset.map(|o| self.full_path(o));
 

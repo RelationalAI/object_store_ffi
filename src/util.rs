@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{ops::Range, str::FromStr};
 use std::ffi::c_char;
 use anyhow::anyhow;
 use pin_project::pin_project;
@@ -27,7 +27,7 @@ pub(crate) fn size_to_ranges(object_size: usize, part_size: usize) -> Vec<Range<
 }
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum Compression {
+pub enum Compression {
     None,
     Gzip,
     Deflate,
@@ -42,15 +42,22 @@ impl TryFrom<*const c_char> for Compression {
             Ok(Compression::None)
         } else {
             let codec_str = unsafe { std::ffi::CStr::from_ptr(value) }.to_str().expect("invalid utf8");
-            match codec_str {
-                "" => Ok(Compression::None),
-                "gzip" => Ok(Compression::Gzip),
-                "deflate" => Ok(Compression::Deflate),
-                "zlib" => Ok(Compression::Zlib),
-                "zstd" => Ok(Compression::Zstd),
-                c => {
-                    Err(anyhow!("compression codec {} not implemented", c))
-                }
+            Compression::from_str(codec_str)
+        }
+    }
+}
+
+impl FromStr for Compression {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "" => Ok(Compression::None),
+            "gzip" => Ok(Compression::Gzip),
+            "deflate" => Ok(Compression::Deflate),
+            "zlib" => Ok(Compression::Zlib),
+            "zstd" => Ok(Compression::Zstd),
+            c => {
+                Err(anyhow!("compression codec {} not implemented", c))
             }
         }
     }

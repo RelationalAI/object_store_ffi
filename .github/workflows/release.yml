@@ -68,3 +68,30 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload ${{ github.ref_name }} ${{ steps.archive.outputs.path }}
+  binaries:
+    needs: release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - build: linux-64-bit
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            prebuild: "true"
+            command: cargo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+      - run: ${{ matrix.prebuild }}
+      - run: ${{ matrix.command }} build --release --target ${{ matrix.target }} --bin sfcp --features sfcp,openssl/vendored
+      - name: Copy and Output
+        id: copy
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/sfcp sfcp
+          echo "path=sfcp" >> $GITHUB_OUTPUT
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} ${{ steps.copy.outputs.path }}
