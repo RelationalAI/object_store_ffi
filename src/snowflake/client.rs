@@ -74,10 +74,40 @@ pub(crate) struct SnowflakeQueryData {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) struct SnowflakeStageCreds {
+pub(crate) struct SnowflakeStageAwsCreds {
     pub aws_key_id: String,
     pub aws_secret_key: String,
     pub aws_token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) struct SnowflakeStageAzureCreds {
+    pub azure_sas_token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum SnowflakeStageCreds {
+    Aws(SnowflakeStageAwsCreds),
+    Azure(SnowflakeStageAzureCreds)
+}
+
+impl SnowflakeStageCreds {
+    pub(crate) fn as_aws(&self) -> crate::Result<&SnowflakeStageAwsCreds> {
+        match self {
+            SnowflakeStageCreds::Aws(c) => Ok(c),
+            SnowflakeStageCreds::Azure(_) => Err(Error::invalid_response("Expected AWS credentials but got Azure"))
+        }
+    }
+
+    pub(crate) fn as_azure(&self) -> crate::Result<&SnowflakeStageAzureCreds> {
+        match self {
+            SnowflakeStageCreds::Azure(c) => Ok(c),
+            SnowflakeStageCreds::Aws(_) => Err(Error::invalid_response("Expected Azure credentials but got AWS"))
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,10 +144,11 @@ pub(crate) enum NormalizedStageInfo {
         #[serde(skip_serializing_if = "Option::is_none")]
         test_endpoint: Option<String>,
     },
-    BlobStorage {
+    Azure {
         storage_account: String,
         container: String,
         prefix: String,
+        azure_sas_token: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         end_point: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,18 +163,33 @@ impl TryFrom<&SnowflakeStageInfo> for NormalizedStageInfo {
         if value.location_type == "S3" {
             let (bucket, prefix) = value.location.split_once('/')
                 .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the bucket name"))?;
+            let creds = value.creds.as_aws()?;
             return Ok(NormalizedStageInfo::S3 {
                 bucket: bucket.to_string(),
                 prefix: prefix.to_string(),
                 region: value.region.clone(),
-                aws_key_id: value.creds.aws_key_id.clone(),
-                aws_secret_key: value.creds.aws_secret_key.clone(),
-                aws_token: value.creds.aws_token.clone(),
+                aws_key_id: creds.aws_key_id.clone(),
+                aws_secret_key: creds.aws_secret_key.clone(),
+                aws_token: creds.aws_token.clone(),
+                end_point: value.end_point.clone(),
+                test_endpoint: value.test_endpoint.clone()
+            })
+        } else if value.location_type == "AZURE" {
+            let (container, prefix) = value.location.split_once('/')
+                .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the container name"))?;
+            let creds = value.creds.as_azure()?;
+            return Ok(NormalizedStageInfo::Azure {
+                storage_account: value.storage_account
+                    .clone()
+                    .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the storage account name"))?,
+                container: container.to_string(),
+                prefix: prefix.to_string(),
+                azure_sas_token: creds.azure_sas_token.clone(),
                 end_point: value.end_point.clone(),
                 test_endpoint: value.test_endpoint.clone()
             })
         } else {
-            return Err(Error::not_implemented("Azure BlobStorage is not implemented"));
+            return Err(Error::not_implemented(format!("Location type {} is not implemented", value.location_type)));
         }
     }
 }

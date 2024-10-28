@@ -433,9 +433,9 @@ impl Client {
                 let (store, crypto_material_provider, stage_prefix, extension) = build_store_for_snowflake_stage(map, config.retry_config.clone()).await?;
 
                 let prefix = match (stage_prefix, config.prefix) {
-                    (s, Some(u)) if s.ends_with("/") => Some(format!("{s}{u}")),
-                    (s, Some(u)) => Some(format!("{s}/{u}")),
-                    (s, None) => Some(s)
+                    (Some(s), Some(u)) if s.ends_with("/") => Some(format!("{s}{u}")),
+                    (Some(s), Some(u)) => Some(format!("{s}/{u}")),
+                    (s, u) => s.or(u)
                 };
 
                 config.prefix = prefix;

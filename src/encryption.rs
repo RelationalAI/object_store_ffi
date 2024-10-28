@@ -28,7 +28,7 @@ pub(crate) trait CryptoMaterialProvider:
     async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> crate::Result<ContentCryptoMaterial>;
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum CryptoScheme {
     Aes256Gcm,
     Aes128Cbc
