@@ -1,6 +1,6 @@
 use crate::encryption::{CrypterReader, CrypterWriter, Mode};
 use crate::{destroy_with_runtime, export_queued_op, with_retries, BoxedReader, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, RT, SQ};
-use crate::util::{size_to_ranges, Compression, CompressedWriter, with_decoder, cstr_to_path};
+use crate::util::{cstr_to_path, size_to_ranges, with_decoder, BufWriter, CompressedWriter, Compression};
 use crate::error::{Error, ErrorExt, Kind as ErrorKind, RetryState};
 use crate::with_cancellation;
 
@@ -23,7 +23,7 @@ impl Client {
         let concurrency = self.config.multipart_put_concurrency;
         let writer: BoxedUpload = if let Some(cryptmp) = self.crypto_material_provider.as_ref() {
             let (material, attrs) = cryptmp.material_for_write(path.as_ref(), None).await?;
-            let writer = object_store::buffered::BufWriter::with_capacity(
+            let writer = BufWriter::with_capacity(
                 Arc::clone(&self.store),
                 path.clone(),
                 part_size
@@ -35,7 +35,7 @@ impl Client {
             Box::new(encrypter_writer)
         } else {
             Box::new(
-                object_store::buffered::BufWriter::with_capacity(
+                BufWriter::with_capacity(
                     Arc::clone(&self.store),
                     path.clone(),
                     part_size
