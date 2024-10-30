@@ -112,13 +112,8 @@ impl Client {
         if len < self.config.multipart_put_threshold {
             if let Some(cryptmp) = self.crypto_material_provider.as_ref() {
                 let (material, attrs) = cryptmp.material_for_write(path.as_ref(), Some(slice.len())).await?;
-                let ciphertext = if slice.is_empty() {
-                    // Do not write any padding if there was no data
-                    vec![]
-                } else {
-                    encrypt(&slice, &material)
-                        .map_err(ErrorKind::ContentEncrypt)?
-                };
+                let ciphertext = encrypt(&slice, &material)
+                    .map_err(ErrorKind::ContentEncrypt)?;
                 let _ = self.store.put_opts(
                     path,
                     ciphertext.into(),
