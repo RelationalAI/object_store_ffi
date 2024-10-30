@@ -38,7 +38,7 @@ mod stream;
 use stream::{GetStreamResponse, PutStreamResponse};
 
 mod metrics;
-pub use metrics::{InstrumentedAllocator, METRICS};
+pub use metrics::InstrumentedAllocator;
 
 mod snowflake;
 use snowflake::build_store_for_snowflake_stage;
@@ -536,6 +536,7 @@ macro_rules! with_retries {
                 Err(e) => {
                     match retry_state.should_retry(e) {
                         Ok((e, info, duration)) => {
+                            ::metrics::counter!(crate::metrics::total_retries).increment(info.retries.unwrap_or(1) as u64);
                             tracing::info!("retrying error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
                             tokio::time::sleep(duration).await;
                             continue 'retry;
@@ -767,6 +768,9 @@ pub extern "C" fn start(
 
     tracing_subscriber::fmt::init();
 
+    crate::metrics::setup_recorder();
+    crate::metrics::init_metrics();
+
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
     rt_builder.on_thread_start(|| {
@@ -917,8 +921,11 @@ pub extern "C" fn _destroy_in_tokio_thread() -> CResult {
 }
 
 #[no_mangle]
-pub extern "C" fn current_metrics() -> metrics::MetricsSnapshot {
-    metrics::MetricsSnapshot::current()
+pub extern "C" fn current_metrics() -> *const c_char {
+    let snapshot = metrics::MetricsSnapshot::current();
+    let string = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
+    let c_string = CString::new(string).expect("should not have nulls");
+    c_string.into_raw()
 }
 
 #[cfg(test)]
