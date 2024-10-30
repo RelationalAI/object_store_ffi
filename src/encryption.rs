@@ -511,13 +511,9 @@ impl<R: AsyncRead> AsyncRead for CrypterReader<R> {
                     }
                     let amt = wrapped.filled().len();
                     this.inbuf.advance(amt);
-                    if amt == 0 {
-                        // never crypted anything, go to State::Done without flushing
-                        State::Done
-                    } else {
-                        // got some bytes, fill buffer
-                        State::Filling
-                    }
+                    // maybe got some bytes, fill buffer
+                    State::Filling
+
                 }
                 State::Filling => {
                     if this.inbuf.filled().len() <= extract_tag_len {
@@ -762,6 +758,11 @@ impl<W: AsyncWrite> CrypterWriter<W> {
 
     fn finalize(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> std::io::Result<()> {
         let this = self.project();
+        if !*this.was_updated {
+            // crypter was never updated, update it with empty slice to generate padding
+            let amt = this.crypter.update(&[], this.buf.unfilled_mut())?;
+            this.buf.advance(amt);
+        }
         if *this.extract_tag_len > 0 {
             if this.tag_buf.filled().len() == *this.extract_tag_len {
                 this.crypter.set_tag(this.tag_buf.filled())?;
@@ -828,12 +829,10 @@ impl<W: AsyncWrite> AsyncWrite for CrypterWriter<W> {
 
         // These bytes cannot be the tag, crypt them into main buffer
         let first = &buf[..last_bytes_offset];
-        if first.len() > 0 {
-            let amt = this.crypter.update(first, this.buf.unfilled_mut())?;
-            this.buf.advance(amt);
-            // crypter was updated, needs to be finalized
-            *this.was_updated = true;
-        }
+        let amt = this.crypter.update(first, this.buf.unfilled_mut())?;
+        this.buf.advance(amt);
+        // crypter was updated, needs to be finalized
+        *this.was_updated = true;
         Poll::Ready(Ok(first.len() + last.len()))
     }
 
@@ -843,8 +842,7 @@ impl<W: AsyncWrite> AsyncWrite for CrypterWriter<W> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // crypter can only be finalized if it was updated at least once
-        if !self.finalized && self.was_updated {
+        if !self.finalized {
             if self.buf.unfilled().len() < self.block_size + self.append_tag_len {
                 ready!(self.as_mut().flush_buf(cx))?;
             }
@@ -1025,6 +1023,86 @@ mod tests {
         let plaintext = decrypt(&ciphertext, &material).unwrap();
 
         assert_eq!(data, plaintext);
+    }
+
+    #[tokio::test]
+    async fn content_encryption_aes_cbc_zero_length_round_trip() {
+        let data: Vec<u8> = vec![];
+
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes128Cbc);
+
+        let ciphertext1 = encrypt(&data, &material).unwrap();
+
+        let mut reader = CrypterReader::new(data.as_slice(), Mode::Encrypt, &material).unwrap();
+        let mut ciphertext2 = vec![];
+        reader.read_to_end(&mut ciphertext2).await.unwrap();
+
+        let mut ciphertext3 = vec![];
+        let mut writer = CrypterWriter::new(&mut ciphertext3, Mode::Encrypt, &material).unwrap();
+        writer.write_all(&data).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let block_size = material.scheme.cipher().block_size();
+        assert_eq!(block_size, ciphertext1.len());
+        assert_eq!(block_size, ciphertext2.len());
+        assert_eq!(block_size, ciphertext3.len());
+
+        let plaintext1 = decrypt(&ciphertext1, &material).unwrap();
+
+        let mut reader = CrypterReader::new(ciphertext2.as_slice(), Mode::Decrypt, &material).unwrap();
+        let mut plaintext2 = vec![];
+        reader.read_to_end(&mut plaintext2).await.unwrap();
+
+        let mut plaintext3 = vec![];
+        let mut writer = CrypterWriter::new(&mut plaintext3, Mode::Decrypt, &material).unwrap();
+        writer.write_all(&ciphertext3).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(data, plaintext1);
+        assert_eq!(data, plaintext2);
+        assert_eq!(data, plaintext3);
+    }
+
+    #[tokio::test]
+    async fn content_encryption_aes_gcm_zero_length_round_trip() {
+        let data: Vec<u8> = vec![];
+
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes256Gcm);
+
+        let ciphertext1 = encrypt(&data, &material).unwrap();
+
+        let mut reader = CrypterReader::new(data.as_slice(), Mode::Encrypt, &material).unwrap();
+        let mut ciphertext2 = vec![];
+        reader.read_to_end(&mut ciphertext2).await.unwrap();
+
+        let mut ciphertext3 = vec![];
+        let mut writer = CrypterWriter::new(&mut ciphertext3, Mode::Encrypt, &material).unwrap();
+        writer.write_all(&data).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let tag_len = material.scheme.tag_len();
+        assert_eq!(tag_len, ciphertext1.len());
+        assert_eq!(tag_len, ciphertext2.len());
+        assert_eq!(tag_len, ciphertext3.len());
+
+        let plaintext1 = decrypt(&ciphertext1, &material).unwrap();
+
+        let mut reader = CrypterReader::new(ciphertext2.as_slice(), Mode::Decrypt, &material).unwrap();
+        let mut plaintext2 = vec![];
+        reader.read_to_end(&mut plaintext2).await.unwrap();
+
+        let mut plaintext3 = vec![];
+        let mut writer = CrypterWriter::new(&mut plaintext3, Mode::Decrypt, &material).unwrap();
+        writer.write_all(&ciphertext3).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(data, plaintext1);
+        assert_eq!(data, plaintext2);
+        assert_eq!(data, plaintext3);
     }
 
     #[test]
