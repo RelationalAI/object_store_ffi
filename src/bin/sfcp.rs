@@ -49,7 +49,11 @@ mod sfcp {
     async fn setup_client(stage: &str) -> anyhow::Result<object_store_ffi::Client> {
         let config_map = serde_json::from_value(serde_json::json!({
             "url": format!("snowflake://{stage}"),
-            "snowflake_stage": stage
+            "snowflake_stage": stage,
+            "max_retries": "1000",
+            "timeout": "40s",
+            "connect_timeout": "40s",
+            "retry_timeout_secs": "180"
         }))?;
 
         let client = object_store_ffi::Client::from_config_map(config_map).await?;
