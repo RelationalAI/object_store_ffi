@@ -557,6 +557,7 @@ impl SnowflakeClient {
                 Err(e) => {
                     match retry_state.should_retry(e) {
                         Ok((e, info, duration)) => {
+                            counter!(metrics::total_sf_retries).increment(info.retries.unwrap_or(1) as u64);
                             tracing::info!("retrying snowflake query error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
                             tokio::time::sleep(duration).await;
                             continue 'retry;

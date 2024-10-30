@@ -201,10 +201,6 @@ impl Kind {
     }
 
     pub(crate) fn error_info(&self) -> ErrorInfo {
-        if matches!(self, Kind::Request(_)) {
-            self.chain()
-                .for_each(|e| println!("----------\n{} {:?}", e, e));
-        }
         let mut retries = None;
 
         match self {

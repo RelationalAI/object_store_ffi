@@ -1,4 +1,4 @@
-use crate::{duration_on_drop, encryption::{encrypt, CrypterReader, CrypterWriter, Mode}, error::Kind as ErrorKind, export_queued_op, metrics, util::cstr_to_path, with_retries, BoxedReader, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, SQ};
+use crate::{duration_on_drop, encryption::{encrypt, CrypterReader, CrypterWriter, Mode}, error::Kind as ErrorKind, export_queued_op, metrics, util::{cstr_to_path, BufWriter}, with_retries, BoxedReader, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, SQ};
 
 use bytes::Bytes;
 use ::metrics::counter;
@@ -173,7 +173,7 @@ impl Client {
         let _guard = duration_on_drop!(metrics::multipart_put_attempt_duration);
         let mut writer: BoxedUpload = if let Some(cryptmp) = self.crypto_material_provider.as_ref() {
             let (material, attrs) = cryptmp.material_for_write(path.as_ref(), Some(slice.len())).await?;
-            let writer = object_store::buffered::BufWriter::with_capacity(
+            let writer = BufWriter::with_capacity(
                 Arc::clone(&self.store),
                 path.clone(),
                 self.config.multipart_put_part_size
@@ -185,7 +185,7 @@ impl Client {
             Box::new(encrypter_writer)
         } else {
             Box::new(
-                object_store::buffered::BufWriter::with_capacity(
+                BufWriter::with_capacity(
                     Arc::clone(&self.store),
                     path.clone(),
                     self.config.multipart_put_part_size
