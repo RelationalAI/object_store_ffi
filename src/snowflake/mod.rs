@@ -6,7 +6,7 @@ use anyhow::Context as AnyhowContext;
 use client::{NormalizedStageInfo, SnowflakeClient, SnowflakeClientConfig};
 
 pub(crate) mod kms;
-use kms::{SnowflakeStageKms, SnowflakeStageKmsConfig};
+use kms::{SnowflakeStageS3Kms, SnowflakeStageAzureKms, SnowflakeStageKmsConfig};
 
 use object_store::{azure::AzureCredential, RetryConfig, ObjectStore};
 use tokio::sync::Mutex;
@@ -392,7 +392,7 @@ pub(crate) async fn build_store_for_snowflake_stage(
 
             let crypto_material_provider = if info.stage_info.is_client_side_encrypted {
                 let kms_config = config.kms_config.unwrap_or_default();
-                let stage_kms = SnowflakeStageKms::new(client.clone(), &config.stage, stage_prefix, kms_config);
+                let stage_kms = SnowflakeStageS3Kms::new(client.clone(), &config.stage, stage_prefix, kms_config);
                 Some::<Arc<dyn CryptoMaterialProvider>>(Arc::new(stage_kms))
             } else {
                 None
@@ -440,7 +440,7 @@ pub(crate) async fn build_store_for_snowflake_stage(
 
             let crypto_material_provider = if info.stage_info.is_client_side_encrypted {
                 let kms_config = config.kms_config.unwrap_or_default();
-                let stage_kms = SnowflakeStageKms::new(client.clone(), &config.stage, stage_prefix, kms_config); // TODO: Azure KMS
+                let stage_kms = SnowflakeStageAzureKms::new(client.clone(), &config.stage, stage_prefix, kms_config);
                 Some::<Arc<dyn CryptoMaterialProvider>>(Arc::new(stage_kms))
             } else {
                 None

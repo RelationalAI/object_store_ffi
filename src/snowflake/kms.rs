@@ -37,7 +37,7 @@ impl Default for SnowflakeStageKmsConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct SnowflakeStageKms {
+pub(crate) struct SnowflakeStageS3Kms {
     client: Arc<SnowflakeClient>,
     stage: String,
     prefix: String,
@@ -45,9 +45,9 @@ pub(crate) struct SnowflakeStageKms {
     keyring: Cache<String, Key>
 }
 
-impl std::fmt::Debug for SnowflakeStageKms {
+impl std::fmt::Debug for SnowflakeStageS3Kms {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SnowflakeStageKms")
+        f.debug_struct("SnowflakeStageS3Kms")
          .field("client", &self.client)
          .field("stage", &self.stage)
          .field("config", &self.config)
@@ -56,14 +56,14 @@ impl std::fmt::Debug for SnowflakeStageKms {
     }
 }
 
-impl SnowflakeStageKms {
+impl SnowflakeStageS3Kms {
     pub(crate) fn new(
         client: Arc<SnowflakeClient>,
         stage: impl Into<String>,
         prefix: impl Into<String>,
         config: SnowflakeStageKmsConfig
-    ) -> SnowflakeStageKms {
-        SnowflakeStageKms {
+    ) -> SnowflakeStageS3Kms {
+        SnowflakeStageS3Kms {
             client,
             stage: stage.into(),
             prefix: prefix.into(),
@@ -77,7 +77,7 @@ impl SnowflakeStageKms {
 }
 
 #[async_trait::async_trait]
-impl CryptoMaterialProvider for SnowflakeStageKms {
+impl CryptoMaterialProvider for SnowflakeStageS3Kms {
     async fn material_for_write(&self, _path: &str, data_len: Option<usize>) -> crate::Result<(ContentCryptoMaterial, Attributes)> {
         let _guard = duration_on_drop!(metrics::material_for_write_duration);
         let info = self.client.current_upload_info(&self.stage).await?;
@@ -192,4 +192,200 @@ impl CryptoMaterialProvider for SnowflakeStageKms {
 
         Ok(content_material)
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct SnowflakeStageAzureKms {
+    client: Arc<SnowflakeClient>,
+    stage: String,
+    prefix: String,
+    config: SnowflakeStageKmsConfig,
+    keyring: Cache<String, Key>,
+}
+
+impl std::fmt::Debug for SnowflakeStageAzureKms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnowflakeStageAzureKms")
+         .field("client", &self.client)
+         .field("stage", &self.stage)
+         .field("config", &self.config)
+         .field("keyring", &"redacted")
+         .finish()
+    }
+}
+
+impl SnowflakeStageAzureKms {
+    pub(crate) fn new(
+        client: Arc<SnowflakeClient>,
+        stage: impl Into<String>,
+        prefix: impl Into<String>,
+        config: SnowflakeStageKmsConfig
+    ) -> SnowflakeStageAzureKms {
+        SnowflakeStageAzureKms {
+            client,
+            stage: stage.into(),
+            prefix: prefix.into(),
+            keyring: Cache::builder()
+                .max_capacity(config.keyring_capacity as u64)
+                .time_to_live(config.keyring_ttl)
+                .build(),
+            config
+        }
+    }
+}
+
+const AZURE_MATDESC_KEY: &str = "matdesc";
+const AZURE_ENCDATA_KEY: &str = "encryptiondata";
+
+#[async_trait::async_trait]
+impl CryptoMaterialProvider for SnowflakeStageAzureKms {
+    async fn material_for_write(&self, _path: &str, data_len: Option<usize>) -> crate::Result<(ContentCryptoMaterial, Attributes)> {
+        let _guard = duration_on_drop!(metrics::material_for_write_duration);
+        let info = self.client.current_upload_info(&self.stage).await?;
+
+        let encryption_material = info.encryption_material.as_ref()
+            .ok_or_else(|| ErrorKind::StorageNotEncrypted(self.stage.clone()))?;
+
+        let description = MaterialDescription {
+            smk_id: encryption_material.smk_id.to_string(),
+            query_id: encryption_material.query_id.clone(),
+            key_size: "128".to_string()
+        };
+        let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
+            .map_err(ErrorKind::MaterialDecode)?;
+
+        let scheme = self.config.crypto_scheme;
+        let material = ContentCryptoMaterial::generate(scheme);
+        let encrypted_cek = material.cek.clone().encrypt_aes_128_ecb(&master_key)
+            .map_err(ErrorKind::MaterialCrypt)?;
+        // TODO: should this be AES_256 or 128 for Azure? I am confused because the metadata
+        // says 256, but the master key that I am seeing has 128.
+
+        let mut attributes = Attributes::new();
+
+        // TODO: do we need to add aad?
+
+        // We hardcode most of these values as the Go Snowflake client does (see
+        // https://github.com/snowflakedb/gosnowflake/blob/099708d318689634a558f705ccc19b3b7b278972/azure_storage_client.go#L152)
+        let encryption_data = EncryptionData {
+            encryption_mode: "FullBlob".to_string(),
+            wrapped_content_key: WrappedContentKey {
+                key_id: "symmKey1".to_string(),
+                encrypted_key: encrypted_cek.as_base64(),
+                algorithm: "AES_CBC_256".to_string(),
+            },
+            encryption_agent: EncryptionAgent {
+                protocol: "1.0".to_string(),
+                encryption_algorithm: "AES_CBC_128".to_string(),
+            },
+            content_encryption_i_v: material.iv.as_base64(),
+            key_wrapping_metadata: KeyWrappingMetadata {
+                encryption_library: "Java 5.3.0".to_string(),
+            },
+        };
+
+        attributes.insert(
+            Attribute::Metadata(AZURE_ENCDATA_KEY.into()),
+            AttributeValue::from(serde_json::to_string(&encryption_data).context("failed to encode encryption data").to_err()?)
+        );
+
+        attributes.insert(
+            Attribute::Metadata(AZURE_MATDESC_KEY.into()),
+            AttributeValue::from(serde_json::to_string(&description).context("failed to encode matdesc").to_err()?)
+        );
+
+        // TODO: try to attach the (ununcrypted) content length to the file somehow
+        // TODO: try to attach a hash of the file
+
+        Ok((material, attributes))
+    }
+
+    async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> crate::Result<ContentCryptoMaterial> {
+        // TODO: factor out code that is shared with S3 variant?
+
+        let _guard = duration_on_drop!(metrics::material_from_metadata_duration);
+        let path = path.strip_prefix(&self.prefix).unwrap_or(path);
+        let required_attribute = |key: &'static str| {
+            let v: &str = attr.get(&Attribute::Metadata(key.into()))
+                .ok_or_else(|| Error::required_config(format!("missing required attribute `{}`", key)))?
+                .as_ref();
+            Ok::<_, Error>(v)
+        };
+
+        let material_description: MaterialDescription = deserialize_str(required_attribute(AZURE_MATDESC_KEY)?)
+            .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
+
+        let master_key = self.keyring.try_get_with(material_description.query_id, async {
+            let info = self.client.fetch_path_info(&self.stage, path).await?;
+            let position = info.src_locations.iter().position(|l| l == path)
+                .ok_or_else(|| Error::invalid_response("path not found"))?;
+            let encryption_material = info.encryption_material.get(position)
+                .cloned()
+                .ok_or_else(|| Error::invalid_response("src locations and encryption material length mismatch"))?
+                .ok_or_else(|| Error::invalid_response("path not encrypted"))?;
+
+            let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
+                .map_err(ErrorKind::MaterialDecode)?;
+            counter!(metrics::total_keyring_miss).increment(1);
+            Ok::<_, Error>(master_key)
+        }).await?;
+        counter!(metrics::total_keyring_get).increment(1);
+
+        let encryption_data: EncryptionData = deserialize_str(required_attribute(AZURE_ENCDATA_KEY)?)
+            .map_err(Error::deserialize_response_err("failed to deserialize encryption data"))?;
+
+        let cek = EncryptedKey::from_base64(&encryption_data.wrapped_content_key.encrypted_key)
+            .map_err(ErrorKind::MaterialDecode)?;
+        let cek = cek.decrypt_aes_128_ecb(&master_key)
+            .map_err(ErrorKind::MaterialCrypt)?;
+        let iv = Iv::from_base64(&encryption_data.content_encryption_i_v)
+            .map_err(ErrorKind::MaterialDecode)?;
+
+        let scheme = match encryption_data.encryption_agent.encryption_algorithm.as_str() {
+            "AES_GCM_256" => CryptoScheme::Aes256Gcm,
+            "AES_CBC_128" => CryptoScheme::Aes128Cbc,
+            v => unimplemented!("encryption algorithm `{}` not implemented", v)
+        };
+
+        let content_material = ContentCryptoMaterial {
+            scheme,
+            cek,
+            iv,
+            aad: None
+        };
+        
+        Ok(content_material)
+    }
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct EncryptionData {
+    encryption_mode: String,
+    wrapped_content_key: WrappedContentKey,
+    content_encryption_i_v: String,
+    encryption_agent: EncryptionAgent,
+    key_wrapping_metadata: KeyWrappingMetadata,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WrappedContentKey {
+    key_id: String,
+    encrypted_key: String,
+    algorithm: String, // alg for encrypting the key
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct EncryptionAgent {
+    protocol: String,
+    encryption_algorithm: String, // alg for encryption the content
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct KeyWrappingMetadata {
+    encryption_library: String,
 }
