@@ -74,16 +74,40 @@ pub(crate) struct SnowflakeQueryData {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) struct SnowflakeStageCreds {
-    // TODO: make this an enum
+pub(crate) struct SnowflakeStageAwsCreds {
+    pub aws_key_id: String,
+    pub aws_secret_key: String,
+    pub aws_token: String,
+}
 
-    // AWS
-    pub aws_key_id: Option<String>,
-    pub aws_secret_key: Option<String>,
-    pub aws_token: Option<String>,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) struct SnowflakeStageAzureCreds {
+    pub azure_sas_token: String,
+}
 
-    // Azure
-    pub azure_sas_token: Option<String>,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum SnowflakeStageCreds {
+    Aws(SnowflakeStageAwsCreds),
+    Azure(SnowflakeStageAzureCreds),
+}
+
+impl SnowflakeStageCreds {
+    pub(crate) fn as_aws(&self) -> crate::Result<&SnowflakeStageAwsCreds> {
+        match self {
+            SnowflakeStageCreds::Aws(creds) => Ok(creds),
+            SnowflakeStageCreds::Azure(_) => Err(Error::invalid_response("Expected AWS credentials, but got Azure ones")),
+        }
+    }
+
+    pub(crate) fn as_azure(&self) -> crate::Result<&SnowflakeStageAzureCreds> {
+        match self {
+            SnowflakeStageCreds::Azure(creds) => Ok(creds),
+            SnowflakeStageCreds::Aws(_) => Err(Error::invalid_response("Expected Azure credentials, but got AWS ones")),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,29 +163,34 @@ impl TryFrom<&SnowflakeStageInfo> for NormalizedStageInfo {
         if value.location_type == "S3" {
             let (bucket, prefix) = value.location.split_once('/')
                 .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the bucket name"))?;
+            let creds = value.creds.as_aws()?;
             return Ok(NormalizedStageInfo::S3 {
                 bucket: bucket.to_string(),
                 prefix: prefix.to_string(),
                 region: value.region.clone(),
-                aws_key_id: value.creds.aws_key_id.clone().expect("AWS key ID is missing"),
-                aws_secret_key: value.creds.aws_secret_key.clone().expect("AWS secret key is missing"),
-                aws_token: value.creds.aws_token.clone().expect("AWS token is missing"),
+                aws_key_id: creds.aws_key_id.clone(),
+                aws_secret_key: creds.aws_secret_key.clone(),
+                aws_token: creds.aws_token.clone(),
                 end_point: value.end_point.clone(),
                 test_endpoint: value.test_endpoint.clone()
             })
         } else if value.location_type == "AZURE" {
-            let (storage_account, container) = value.location.split_once('/')
+            let (container, prefix) = value.location.split_once('/')
+                .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the container name"))?;
+            let creds = value.creds.as_azure()?;
+            let storage_account = value.storage_account
+                .clone()
                 .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the storage account name"))?;
             return Ok(NormalizedStageInfo::BlobStorage {
-                storage_account: storage_account.to_string(),
+                storage_account: storage_account,
                 container: container.to_string(),
-                prefix: value.path.clone(),
-                azure_sas_token: value.creds.azure_sas_token.clone().expect("Azure SAS token is missing"),
+                prefix: prefix.to_string(),
+                azure_sas_token: creds.azure_sas_token.clone(),
                 end_point: value.end_point.clone(),
                 test_endpoint: value.test_endpoint.clone()
             })
         } else {
-            return Err(Error::not_implemented("Unknown location type: {value.location_type}"));
+            return Err(Error::not_implemented(format!("Location type {} is not implemented", value.location_type)));
         }
     }
 }
