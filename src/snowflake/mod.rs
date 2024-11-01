@@ -6,9 +6,11 @@ use anyhow::Context as AnyhowContext;
 use client::{NormalizedStageInfo, SnowflakeClient, SnowflakeClientConfig};
 
 pub(crate) mod kms;
-use kms::{SnowflakeStageKms, SnowflakeStageKmsConfig};
+use kms::{SnowflakeStageS3Kms, SnowflakeStageAzureKms, SnowflakeStageKmsConfig};
 
-use object_store::{RetryConfig, ObjectStore};
+mod resolver;
+
+use object_store::{azure::AzureCredential, RetryConfig, ObjectStore};
 use tokio::sync::Mutex;
 use std::sync::Arc;
 
@@ -64,24 +66,37 @@ impl object_store::CredentialProvider for S3StageCredentialProvider {
                 }
             })?;
 
+        if info.stage_info.location_type != "S3" {
+            return Err(object_store::Error::Generic {
+                store: "S3",
+                source: Error::invalid_response("Location type must be S3 for this provider").into()
+            })
+        }
+
+        let new_creds = info.stage_info.creds.as_aws()
+            .map_err(|e| object_store::Error::Generic {
+                store: "S3",
+                source: e.into()
+            })?;
+
         let mut locked = self.cached.lock().await;
 
         match locked.as_ref() {
-            Some(creds) => if creds.key_id == info.stage_info.creds.aws_key_id {
+            Some(creds) => if creds.key_id == new_creds.aws_key_id {
                 return Ok(Arc::clone(creds));
             }
             _ => {}
         }
 
         // The session token is empty when testing against minio
-        let token = match info.stage_info.creds.aws_token.trim() {
+        let token = match new_creds.aws_token.trim() {
             "" => None,
             token => Some(token.to_string())
         };
 
         let creds = Arc::new(object_store::aws::AwsCredential {
-            key_id: info.stage_info.creds.aws_key_id.clone(),
-            secret_key: info.stage_info.creds.aws_secret_key.clone(),
+            key_id: new_creds.aws_key_id.clone(),
+            secret_key: new_creds.aws_secret_key.clone(),
             token
         });
 
@@ -91,6 +106,93 @@ impl object_store::CredentialProvider for S3StageCredentialProvider {
     }
 }
 
+
+#[derive(Debug)]
+pub(crate) struct SnowflakeAzureExtension {
+    stage: String,
+    client: Arc<SnowflakeClient>,
+}
+
+#[async_trait::async_trait]
+impl Extension for SnowflakeAzureExtension {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn current_stage_info(&self) -> crate::Result<String> {
+        let stage_info = &self
+            .client
+            .current_upload_info(&self.stage)
+            .await?
+            .stage_info;
+        let stage_info: NormalizedStageInfo = stage_info.try_into()?;
+        let string = serde_json::to_string(&stage_info)
+            .context("failed to encode stage_info as json").to_err()?;
+        Ok(string)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AzureStageCredentialProvider {
+    stage: String,
+    client: Arc<SnowflakeClient>,
+    cached: Mutex<Option<Arc<object_store::azure::AzureCredential>>>
+}
+
+impl AzureStageCredentialProvider {
+    pub(crate) fn new(stage: impl AsRef<str>, client: Arc<SnowflakeClient>) -> AzureStageCredentialProvider {
+        AzureStageCredentialProvider { stage: stage.as_ref().to_string(), client, cached: Mutex::new(None) }
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::CredentialProvider for AzureStageCredentialProvider {
+    type Credential = object_store::azure::AzureCredential;
+    async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+        let info = self.client.current_upload_info(&self.stage).await
+            .map_err(|e| {
+                object_store::Error::Generic {
+                    store: "MicrosoftAzure",
+                    source: e.into()
+                }
+            })?;
+
+        if info.stage_info.location_type != "AZURE" {
+            return Err(object_store::Error::Generic {
+                store: "MicrosoftAzure",
+                source: Error::invalid_response("Location type must be AZURE for this provider").into()
+            })
+        }
+
+        let new_creds = info.stage_info.creds.as_azure()
+            .map_err(|e| object_store::Error::Generic {
+                store: "MicrosoftAzure",
+                source: e.into()
+            })?;
+        
+
+        let token_bytes = new_creds.azure_sas_token.trim_start_matches('?').as_bytes();
+        let new_pairs = url::form_urlencoded::parse(token_bytes)
+            .into_owned()
+            .collect();
+        
+        let mut locked = self.cached.lock().await;
+
+        match locked.as_ref() {
+            Some(creds) => {
+                if matches!(creds.as_ref(), AzureCredential::SASToken(pairs) if *pairs == new_pairs) {
+                    return Ok(Arc::clone(creds));
+                }
+            }
+            _ => {}
+        }
+
+        let creds = Arc::new(AzureCredential::SASToken(new_pairs));
+
+        *locked = Some(Arc::clone(&creds));
+
+        Ok(creds)
+    }
+}
 
 #[repr(C)]
 pub struct StageInfoResponse {
@@ -235,7 +337,7 @@ pub(crate) async fn build_store_for_snowflake_stage(
 ) -> crate::Result<(
     Arc<dyn ObjectStore>,
     Option<Arc<dyn CryptoMaterialProvider>>,
-    String,
+    Option<String>,
     ClientExtension
 )> {
     let config = validate_config_for_snowflake(&mut config_map, retry_config.clone())?;
@@ -290,7 +392,7 @@ pub(crate) async fn build_store_for_snowflake_stage(
 
             let crypto_material_provider = if info.stage_info.is_client_side_encrypted {
                 let kms_config = config.kms_config.unwrap_or_default();
-                let stage_kms = SnowflakeStageKms::new(client.clone(), &config.stage, stage_prefix, kms_config);
+                let stage_kms = SnowflakeStageS3Kms::new(client.clone(), &config.stage, stage_prefix, kms_config);
                 Some::<Arc<dyn CryptoMaterialProvider>>(Arc::new(stage_kms))
             } else {
                 None
@@ -301,10 +403,71 @@ pub(crate) async fn build_store_for_snowflake_stage(
                 client
             });
 
-            Ok((Arc::new(store), crypto_material_provider, stage_prefix.to_string(), extension))
+            Ok((Arc::new(store), crypto_material_provider, Some(stage_prefix.to_string()), extension))
+        }
+        "AZURE" => {
+            let (container, stage_prefix) = info.stage_info.location.split_once('/')
+                .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the container name"))?;
+            let storage_account = info.stage_info.storage_account
+                .clone()
+                .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the storage account name"))?;
+
+            let provider = AzureStageCredentialProvider::new(&config.stage, client.clone());
+
+            let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
+                .with_account(storage_account)
+                .with_container_name(container)
+                .with_credentials(Arc::new(provider))
+                .with_retry(retry_config);
+
+            if let Some(test_endpoint) = &info.stage_info.test_endpoint {
+                builder = builder.with_endpoint(test_endpoint.to_string());
+                let mut azurite_host = url::Url::parse(&test_endpoint)
+                    .map_err(Error::invalid_config_err("failed to parse azurite_host"))?;
+                azurite_host.set_path("");
+                unsafe { std::env::set_var("AZURITE_BLOB_STORAGE_URL", azurite_host.as_str()) };
+                config_map.insert("allow_invalid_certificates".into(), "true".into());
+                config_map.insert("azure_storage_use_emulator".into(), "true".into());
+            }
+
+            for (key, value) in config_map {
+                builder = builder.with_config(key.parse()?, value);
+            }
+
+            let store = builder.build()?;
+
+            if config.kms_config.is_some() && !info.stage_info.is_client_side_encrypted {
+                return Err(ErrorKind::StorageNotEncrypted(config.stage.clone()).into());
+            }
+
+            let crypto_material_provider = if info.stage_info.is_client_side_encrypted {
+                let kms_config = config.kms_config.unwrap_or_default();
+                let stage_kms = SnowflakeStageAzureKms::new(
+                    client.clone(), 
+                    &config.stage, 
+                    stage_prefix, 
+                    kms_config,
+                );
+                Some::<Arc<dyn CryptoMaterialProvider>>(Arc::new(stage_kms))
+            } else {
+                None
+            };
+
+            let extension = Arc::new(SnowflakeAzureExtension {
+                stage: config.stage.clone(),
+                client
+            });
+
+            let stage_prefix = if stage_prefix.is_empty() {
+                None
+            } else {
+                Some(stage_prefix.to_string())
+            };
+
+            Ok((Arc::new(store), crypto_material_provider, stage_prefix, extension))
         }
         _ => {
-            unimplemented!("unknown stage location type");
+            unimplemented!("unknown stage location type: {}", info.stage_info.location_type);
         }
     }
 }
