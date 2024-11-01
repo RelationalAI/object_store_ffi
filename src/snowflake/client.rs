@@ -75,9 +75,15 @@ pub(crate) struct SnowflakeQueryData {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) struct SnowflakeStageCreds {
-    pub aws_key_id: String,
-    pub aws_secret_key: String,
-    pub aws_token: String,
+    // TODO: make this an enum
+
+    // AWS
+    pub aws_key_id: Option<String>,
+    pub aws_secret_key: Option<String>,
+    pub aws_token: Option<String>,
+
+    // Azure
+    pub azure_sas_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,6 +124,7 @@ pub(crate) enum NormalizedStageInfo {
         storage_account: String,
         container: String,
         prefix: String,
+        azure_sas_token: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         end_point: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,14 +143,25 @@ impl TryFrom<&SnowflakeStageInfo> for NormalizedStageInfo {
                 bucket: bucket.to_string(),
                 prefix: prefix.to_string(),
                 region: value.region.clone(),
-                aws_key_id: value.creds.aws_key_id.clone(),
-                aws_secret_key: value.creds.aws_secret_key.clone(),
-                aws_token: value.creds.aws_token.clone(),
+                aws_key_id: value.creds.aws_key_id.clone().expect("AWS key ID is missing"),
+                aws_secret_key: value.creds.aws_secret_key.clone().expect("AWS secret key is missing"),
+                aws_token: value.creds.aws_token.clone().expect("AWS token is missing"),
+                end_point: value.end_point.clone(),
+                test_endpoint: value.test_endpoint.clone()
+            })
+        } else if value.location_type == "AZURE" {
+            let (storage_account, container) = value.location.split_once('/')
+                .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the storage account name"))?;
+            return Ok(NormalizedStageInfo::BlobStorage {
+                storage_account: storage_account.to_string(),
+                container: container.to_string(),
+                prefix: value.path.clone(),
+                azure_sas_token: value.creds.azure_sas_token.clone().expect("Azure SAS token is missing"),
                 end_point: value.end_point.clone(),
                 test_endpoint: value.test_endpoint.clone()
             })
         } else {
-            return Err(Error::not_implemented("Azure BlobStorage is not implemented"));
+            return Err(Error::not_implemented("Unknown location type: {value.location_type}"));
         }
     }
 }
