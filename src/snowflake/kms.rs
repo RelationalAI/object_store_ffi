@@ -1,7 +1,6 @@
-use crate::{duration_on_drop, encryption::{ContentCryptoMaterial, CryptoMaterialProvider, CryptoScheme, EncryptedKey, Iv, Key}, error::{Error, ErrorExt}, metrics, snowflake::SnowflakeClient, util::deserialize_str};
+use crate::{duration_on_drop, encryption::{ContentCryptoMaterial, CryptoMaterialProvider, CryptoScheme, EncryptedKey, Iv, Key}, error::{Error, ErrorExt}, metrics, snowflake::SnowflakeClient, util::{deserialize_str, required_attribute}};
 use crate::error::Kind as ErrorKind;
 
-use ::metrics::counter;
 use serde::{Serialize, Deserialize};
 use object_store::{Attributes, Attribute, AttributeValue};
 use anyhow::Context;
@@ -137,40 +136,25 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
     async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> crate::Result<ContentCryptoMaterial> {
         let _guard = duration_on_drop!(metrics::material_from_metadata_duration);
         let path = path.strip_prefix(&self.prefix).unwrap_or(path);
-        let required_attribute = |key: &'static str| {
-            let v: &str = attr.get(&Attribute::Metadata(key.into()))
-                .ok_or_else(|| Error::required_config(format!("missing required attribute `{}`", key)))?
-                .as_ref();
-            Ok::<_, Error>(v)
-        };
 
-
-        let material_description: MaterialDescription = deserialize_str(required_attribute("x-amz-matdesc")?)
+        let material_description: MaterialDescription = 
+            deserialize_str(required_attribute("x-amz-matdesc", &attr)?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
-        let master_key = self.keyring.try_get_with(material_description.query_id, async {
-            let info = self.client.fetch_path_info(&self.stage, path).await?;
-            let position = info.src_locations.iter().position(|l| l == path)
-                .ok_or_else(|| Error::invalid_response("path not found"))?;
-            let encryption_material = info.encryption_material.get(position)
-                .cloned()
-                .ok_or_else(|| Error::invalid_response("src locations and encryption material length mismatch"))?
-                .ok_or_else(|| Error::invalid_response("path not encrypted"))?;
+        let master_key = &self.client.get_master_key(
+            material_description.query_id.clone(),
+            path,
+            &self.stage,
+            &self.keyring,
+        ).await?;
 
-            let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
-                .map_err(ErrorKind::MaterialDecode)?;
-            counter!(metrics::total_keyring_miss).increment(1);
-            Ok::<_, Error>(master_key)
-        }).await?;
-        counter!(metrics::total_keyring_get).increment(1);
-
-        let cek = EncryptedKey::from_base64(required_attribute("x-amz-key")?)
+        let cek = EncryptedKey::from_base64(required_attribute("x-amz-key", &attr)?)
             .map_err(ErrorKind::MaterialDecode)?;
         let cek = cek.decrypt_aes_128_ecb(&master_key)
             .map_err(ErrorKind::MaterialCrypt)?;
-        let iv = Iv::from_base64(required_attribute("x-amz-iv")?)
+        let iv = Iv::from_base64(required_attribute("x-amz-iv", &attr)?)
             .map_err(ErrorKind::MaterialDecode)?;
-        let alg = required_attribute("x-amz-cek-alg");
+        let alg = required_attribute("x-amz-cek-alg", &attr);
 
         let scheme = match alg {
             Ok("AES/GCM/NoPadding") => CryptoScheme::Aes256Gcm,
@@ -258,12 +242,8 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         let material = ContentCryptoMaterial::generate(scheme);
         let encrypted_cek = material.cek.clone().encrypt_aes_128_ecb(&master_key)
             .map_err(ErrorKind::MaterialCrypt)?;
-        // TODO: should this be AES_256 or 128 for Azure? I am confused because the metadata
-        // says 256, but the master key that I am seeing has 128.
 
         let mut attributes = Attributes::new();
-
-        // TODO: do we need to add aad?
 
         // We hardcode most of these values as the Go Snowflake client does (see
         // https://github.com/snowflakedb/gosnowflake/blob/099708d318689634a558f705ccc19b3b7b278972/azure_storage_client.go#L152)
@@ -286,52 +266,45 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
 
         attributes.insert(
             Attribute::Metadata(AZURE_ENCDATA_KEY.into()),
-            AttributeValue::from(serde_json::to_string(&encryption_data).context("failed to encode encryption data").to_err()?)
+            AttributeValue::from(
+                serde_json::to_string(&encryption_data)
+                    .context("failed to encode encryption data")
+                    .to_err()?
+            )
         );
 
         attributes.insert(
             Attribute::Metadata(AZURE_MATDESC_KEY.into()),
-            AttributeValue::from(serde_json::to_string(&description).context("failed to encode matdesc").to_err()?)
+            AttributeValue::from(
+                serde_json::to_string(&description)
+                    .context("failed to encode matdesc")
+                    .to_err()?
+            )
         );
 
-        // TODO: try to attach the (ununcrypted) content length to the file somehow
         // TODO: try to attach a hash of the file
+        // TODO: do we need to add aad?
 
         Ok((material, attributes))
     }
 
     async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> crate::Result<ContentCryptoMaterial> {
-        // TODO: factor out code that is shared with S3 variant?
-
         let _guard = duration_on_drop!(metrics::material_from_metadata_duration);
         let path = path.strip_prefix(&self.prefix).unwrap_or(path);
-        let required_attribute = |key: &'static str| {
-            let v: &str = attr.get(&Attribute::Metadata(key.into()))
-                .ok_or_else(|| Error::required_config(format!("missing required attribute `{}`", key)))?
-                .as_ref();
-            Ok::<_, Error>(v)
-        };
 
-        let material_description: MaterialDescription = deserialize_str(required_attribute(AZURE_MATDESC_KEY)?)
+        let material_description: MaterialDescription = 
+            deserialize_str(required_attribute(AZURE_MATDESC_KEY, &attr)?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
-        let master_key = self.keyring.try_get_with(material_description.query_id, async {
-            let info = self.client.fetch_path_info(&self.stage, path).await?;
-            let position = info.src_locations.iter().position(|l| l == path)
-                .ok_or_else(|| Error::invalid_response("path not found"))?;
-            let encryption_material = info.encryption_material.get(position)
-                .cloned()
-                .ok_or_else(|| Error::invalid_response("src locations and encryption material length mismatch"))?
-                .ok_or_else(|| Error::invalid_response("path not encrypted"))?;
+        let master_key = &self.client.get_master_key(
+            material_description.query_id.clone(),
+            path,
+            &self.stage,
+            &self.keyring,
+        ).await?;
 
-            let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
-                .map_err(ErrorKind::MaterialDecode)?;
-            counter!(metrics::total_keyring_miss).increment(1);
-            Ok::<_, Error>(master_key)
-        }).await?;
-        counter!(metrics::total_keyring_get).increment(1);
-
-        let encryption_data: EncryptionData = deserialize_str(required_attribute(AZURE_ENCDATA_KEY)?)
+        let encryption_data: EncryptionData = 
+            deserialize_str(required_attribute(AZURE_ENCDATA_KEY, &attr)?)
             .map_err(Error::deserialize_response_err("failed to deserialize encryption data"))?;
 
         let cek = EncryptedKey::from_base64(&encryption_data.wrapped_content_key.encrypted_key)

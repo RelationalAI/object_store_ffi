@@ -8,6 +8,7 @@ use object_store::path::Path;
 use object_store::{Attribute, AttributeValue, Attributes, GetOptions, ObjectStore, TagSet};
 use pin_project::pin_project;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
+use crate::error::Error;
 use crate::error::Kind as ErrorKind;
 use std::error::Error as StdError;
 
@@ -484,4 +485,11 @@ where
 {
     let de = &mut serde_json::Deserializer::from_str(v);
     serde_path_to_error::deserialize(de)
+}
+
+pub(crate) fn required_attribute<'a>(key: &'static str, attr: &'a Attributes) -> Result<&'a str, Error> {
+    let v: &str = attr.get(&Attribute::Metadata(key.into()))
+        .ok_or_else(|| Error::required_config(format!("missing required attribute `{}`", key)))?
+        .as_ref();
+    Ok::<_, Error>(v)
 }
