@@ -282,7 +282,6 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             )
         );
 
-        // TODO: try to attach a hash of the file
         // TODO: do we need to add aad?
 
         Ok((material, attributes))
