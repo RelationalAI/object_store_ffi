@@ -168,15 +168,13 @@ impl object_store::CredentialProvider for AzureStageCredentialProvider {
             })?;
         
 
-        // TODO: understand differences to Andre's method
-        let new_pairs = url::form_urlencoded::parse(new_creds.azure_sas_token.trim_start_matches('?').as_bytes())
+        let token_bytes = new_creds.azure_sas_token.trim_start_matches('?').as_bytes();
+        let new_pairs = url::form_urlencoded::parse(token_bytes)
             .into_owned()
             .collect();
-
         
         let mut locked = self.cached.lock().await;
 
-        // TODO: understand what the caching here does
         match locked.as_ref() {
             Some(creds) => {
                 if matches!(creds.as_ref(), AzureCredential::SASToken(pairs) if *pairs == new_pairs) {
@@ -337,7 +335,7 @@ pub(crate) async fn build_store_for_snowflake_stage(
 ) -> crate::Result<(
     Arc<dyn ObjectStore>,
     Option<Arc<dyn CryptoMaterialProvider>>,
-    String,
+    Option<String>,
     ClientExtension
 )> {
     let config = validate_config_for_snowflake(&mut config_map, retry_config.clone())?;
@@ -403,7 +401,7 @@ pub(crate) async fn build_store_for_snowflake_stage(
                 client
             });
 
-            Ok((Arc::new(store), crypto_material_provider, stage_prefix.to_string(), extension))
+            Ok((Arc::new(store), crypto_material_provider, Some(stage_prefix.to_string()), extension))
         }
         "AZURE" => {
             let (container, stage_prefix) = info.stage_info.location.split_once('/')
@@ -440,7 +438,12 @@ pub(crate) async fn build_store_for_snowflake_stage(
 
             let crypto_material_provider = if info.stage_info.is_client_side_encrypted {
                 let kms_config = config.kms_config.unwrap_or_default();
-                let stage_kms = SnowflakeStageAzureKms::new(client.clone(), &config.stage, stage_prefix, kms_config);
+                let stage_kms = SnowflakeStageAzureKms::new(
+                    client.clone(), 
+                    &config.stage, 
+                    stage_prefix, 
+                    kms_config,
+                );
                 Some::<Arc<dyn CryptoMaterialProvider>>(Arc::new(stage_kms))
             } else {
                 None
@@ -451,14 +454,13 @@ pub(crate) async fn build_store_for_snowflake_stage(
                 client
             });
 
-            // Andre's version has the following. TODO: understand why. Cleaner to return an option rather than an empty stage prefix?
-            // let stage_prefix = if stage_prefix.is_empty() {
-            //     None
-            // } else {
-            //     Some(stage_prefix.to_string())
-            // };
+            let stage_prefix = if stage_prefix.is_empty() {
+                None
+            } else {
+                Some(stage_prefix.to_string())
+            };
 
-            Ok((Arc::new(store), crypto_material_provider, stage_prefix.to_string(), extension))
+            Ok((Arc::new(store), crypto_material_provider, stage_prefix, extension))
         }
         _ => {
             unimplemented!("unknown stage location type: {}", info.stage_info.location_type);
