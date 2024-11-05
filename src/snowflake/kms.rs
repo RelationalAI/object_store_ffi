@@ -282,8 +282,6 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             )
         );
 
-        // TODO: do we need to add aad?
-
         Ok((material, attributes))
     }
 
@@ -314,7 +312,6 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             .map_err(ErrorKind::MaterialDecode)?;
 
         let scheme = match encryption_data.encryption_agent.encryption_algorithm.as_str() {
-            "AES_GCM_256" => CryptoScheme::Aes256Gcm,
             "AES_CBC_128" => CryptoScheme::Aes128Cbc,
             v => unimplemented!("encryption algorithm `{}` not implemented", v)
         };
@@ -323,7 +320,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             scheme,
             cek,
             iv,
-            aad: None
+            aad: None,
         };
         
         Ok(content_material)
