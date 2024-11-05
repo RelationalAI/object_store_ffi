@@ -8,7 +8,6 @@ use moka::future::Cache;
 use crate::{duration_on_drop, error::{Error, RetryState, Kind as ErrorKind}, metrics};
 use crate::util::{deserialize_str, deserialize_slice};
 use crate::encryption::Key;
-// use anyhow::anyhow;
 
 
 #[derive(Debug, Serialize, Deserialize)]
