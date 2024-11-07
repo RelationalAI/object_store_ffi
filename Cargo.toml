@@ -81,3 +81,6 @@ openssl = { version = "0.10.66", features = ["vendored"] }
 
 [dev-dependencies]
 criterion = { version = "0.4", default-features = false, features = ["cargo_bench_support", "html_reports"] }
+
+[patch.crates-io]
+hickory-resolver = { git = "https://github.com/alexrenz/hickory-dns.git", branch = "larger-buffer-024" }
