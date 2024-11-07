@@ -40,7 +40,7 @@ bytes = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "hickory-dns"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "trust-dns"] }
 # object_store = { version = "0.10.1", features = ["azure", "aws"] }
 # Pinned to a specific commit while waiting for upstream
 object_store = { git = "https://github.com/andrebsguedes/arrow-rs.git", tag = "v0.10.2-beta1", features = ["azure", "aws", "experimental-azure-list-offset", "experimental-arbitrary-list-prefix"] }
