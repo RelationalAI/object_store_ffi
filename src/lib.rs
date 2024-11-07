@@ -376,6 +376,8 @@ impl Client {
         let url = map.remove("url")
             .ok_or(Error::invalid_config("config object must have a key named 'url'"))?;
 
+        tracing::info!("creating client for url: {}", url);
+
         let url = url::Url::parse(&url)
             .map_err(Error::invalid_config_err("failed to parse `url`"))?;
 
