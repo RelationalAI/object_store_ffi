@@ -384,7 +384,7 @@ impl RetryState {
     }
 
     pub(crate) fn should_retry_logic(&self) -> bool {
-        let max_retries = 1; // TEMP: lower for easier debugging
+        let max_retries = self.retry_config.max_retries;
         let retry_timeout = self.retry_config.retry_timeout;
         let elapsed = self.start.elapsed();
         let all_retries = self.retries();
