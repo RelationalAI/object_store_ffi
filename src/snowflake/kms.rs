@@ -1,4 +1,5 @@
 use crate::{duration_on_drop, encryption::{ContentCryptoMaterial, CryptoMaterialProvider, CryptoScheme, EncryptedKey, Iv, Key}, error::{Error, ErrorExt}, metrics, snowflake::SnowflakeClient, util::{deserialize_str, required_attribute}};
+use ::metrics::counter;
 use crate::error::Kind as ErrorKind;
 
 use serde::{Serialize, Deserialize};
@@ -141,7 +142,8 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
             deserialize_str(required_attribute("x-amz-matdesc", &attr)?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
-        let master_key = &self.client.get_master_key(
+        let master_key = get_master_key(
+            &self.client,
             material_description.query_id.clone(),
             path,
             &self.stage,
@@ -293,7 +295,8 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             deserialize_str(required_attribute(AZURE_MATDESC_KEY, &attr)?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
-        let master_key = &self.client.get_master_key(
+        let master_key = get_master_key(
+            &self.client,
             material_description.query_id.clone(),
             path,
             &self.stage,
@@ -357,4 +360,29 @@ struct EncryptionAgent {
 #[serde(rename_all = "PascalCase")]
 struct KeyWrappingMetadata {
     encryption_library: String,
+}
+
+async fn get_master_key(
+    client: &SnowflakeClient,
+    query_id: String,
+    path: &str,
+    stage: &str,
+    keyring: &Cache<String, Key>,
+) -> crate::Result<Key> {
+    let master_key = keyring.try_get_with(query_id, async {
+        let info = client.fetch_path_info(stage, path).await?;
+        let position = info.src_locations.iter().position(|l| l == path)
+            .ok_or_else(|| Error::invalid_response("path not found"))?;
+        let encryption_material = info.encryption_material.get(position)
+            .cloned()
+            .ok_or_else(|| Error::invalid_response("src locations and encryption material length mismatch"))?
+            .ok_or_else(|| Error::invalid_response("path not encrypted"))?;
+
+        let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
+            .map_err(ErrorKind::MaterialDecode)?;
+        counter!(metrics::total_keyring_miss).increment(1);
+        Ok::<_, Error>(master_key)
+    }).await?;
+    counter!(metrics::total_keyring_get).increment(1);
+    Ok(master_key)
 }
