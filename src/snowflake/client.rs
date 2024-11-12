@@ -663,30 +663,6 @@ impl SnowflakeClient {
         }).await?;
         Ok(stage_info)
     }
-    pub(crate) async fn get_master_key(
-        &self,
-        query_id: String,
-        path: &str,
-        stage: &str,
-        keyring: &Cache<String, Key>,
-    ) -> crate::Result<Key> {
-        let master_key = keyring.try_get_with(query_id, async {
-            let info = self.fetch_path_info(stage, path).await?;
-            let position = info.src_locations.iter().position(|l| l == path)
-                .ok_or_else(|| Error::invalid_response("path not found"))?;
-            let encryption_material = info.encryption_material.get(position)
-                .cloned()
-                .ok_or_else(|| Error::invalid_response("src locations and encryption material length mismatch"))?
-                .ok_or_else(|| Error::invalid_response("path not encrypted"))?;
-
-            let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
-                .map_err(ErrorKind::MaterialDecode)?;
-            counter!(metrics::total_keyring_miss).increment(1);
-            Ok::<_, Error>(master_key)
-        }).await?;
-        counter!(metrics::total_keyring_get).increment(1);
-        Ok(master_key)
-    }
 }
 
 #[cfg(test)]
