@@ -5,9 +5,8 @@ use std::{collections::HashMap, sync::Arc, time::{Duration, Instant, SystemTime,
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
 use moka::future::Cache;
-use crate::{duration_on_drop, error::{Error, RetryState, Kind as ErrorKind}, metrics};
+use crate::{duration_on_drop, error::{Error, RetryState}, metrics};
 use crate::util::{deserialize_str, deserialize_slice};
-use crate::encryption::Key;
 use super::resolver::HickoryResolverWithEdns;
 
 

@@ -487,7 +487,7 @@ where
     serde_path_to_error::deserialize(de)
 }
 
-pub(crate) fn required_attribute<'a>(key: &'static str, attr: &'a Attributes) -> Result<&'a str, Error> {
+pub(crate) fn required_attribute<'a>(attr: &'a Attributes, key: &'static str) -> Result<&'a str, Error> {
     let v: &str = attr.get(&Attribute::Metadata(key.into()))
         .ok_or_else(|| Error::required_config(format!("missing required attribute `{}`", key)))?
         .as_ref();

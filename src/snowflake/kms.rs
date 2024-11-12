@@ -139,7 +139,7 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
         let path = path.strip_prefix(&self.prefix).unwrap_or(path);
 
         let material_description: MaterialDescription = 
-            deserialize_str(required_attribute("x-amz-matdesc", &attr)?)
+            deserialize_str(required_attribute(&attr, "x-amz-matdesc")?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
         let master_key = get_master_key(
@@ -150,13 +150,13 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
             &self.keyring,
         ).await?;
 
-        let cek = EncryptedKey::from_base64(required_attribute("x-amz-key", &attr)?)
+        let cek = EncryptedKey::from_base64(required_attribute(&attr, "x-amz-key")?)
             .map_err(ErrorKind::MaterialDecode)?;
         let cek = cek.decrypt_aes_128_ecb(&master_key)
             .map_err(ErrorKind::MaterialCrypt)?;
-        let iv = Iv::from_base64(required_attribute("x-amz-iv", &attr)?)
+        let iv = Iv::from_base64(required_attribute(&attr, "x-amz-iv")?)
             .map_err(ErrorKind::MaterialDecode)?;
-        let alg = required_attribute("x-amz-cek-alg", &attr);
+        let alg = required_attribute(&attr, "x-amz-cek-alg");
 
         let scheme = match alg {
             Ok("AES/GCM/NoPadding") => CryptoScheme::Aes256Gcm,
@@ -225,7 +225,7 @@ const AZURE_ENCDATA_KEY: &str = "encryptiondata";
 
 #[async_trait::async_trait]
 impl CryptoMaterialProvider for SnowflakeStageAzureKms {
-    async fn material_for_write(&self, _path: &str, data_len: Option<usize>) -> crate::Result<(ContentCryptoMaterial, Attributes)> {
+    async fn material_for_write(&self, _path: &str, _data_len: Option<usize>) -> crate::Result<(ContentCryptoMaterial, Attributes)> {
         let _guard = duration_on_drop!(metrics::material_for_write_duration);
         let info = self.client.current_upload_info(&self.stage).await?;
 
@@ -292,7 +292,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         let path = path.strip_prefix(&self.prefix).unwrap_or(path);
 
         let material_description: MaterialDescription = 
-            deserialize_str(required_attribute(AZURE_MATDESC_KEY, &attr)?)
+            deserialize_str(required_attribute(&attr, AZURE_MATDESC_KEY)?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
         let master_key = get_master_key(
@@ -304,7 +304,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         ).await?;
 
         let encryption_data: EncryptionData = 
-            deserialize_str(required_attribute(AZURE_ENCDATA_KEY, &attr)?)
+            deserialize_str(required_attribute(&attr, AZURE_ENCDATA_KEY)?)
             .map_err(Error::deserialize_response_err("failed to deserialize encryption data"))?;
 
         let cek = EncryptedKey::from_base64(&encryption_data.wrapped_content_key.encrypted_key)
