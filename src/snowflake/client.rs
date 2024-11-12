@@ -8,6 +8,7 @@ use moka::future::Cache;
 use crate::{duration_on_drop, error::{Error, RetryState, Kind as ErrorKind}, metrics};
 use crate::util::{deserialize_str, deserialize_slice};
 use crate::encryption::Key;
+use super::resolver::HickoryResolverWithEdns;
 
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -348,6 +349,7 @@ impl SnowflakeClient {
         let client = SnowflakeClient {
             config,
             client: reqwest::Client::builder()
+                .dns_resolver(Arc::new(HickoryResolverWithEdns::default()))
                 .timeout(Duration::from_secs(180))
                 .build().unwrap(),
             token: Arc::new(Mutex::new(None)),

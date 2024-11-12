@@ -8,6 +8,8 @@ use client::{NormalizedStageInfo, SnowflakeClient, SnowflakeClientConfig};
 pub(crate) mod kms;
 use kms::{SnowflakeStageS3Kms, SnowflakeStageAzureKms, SnowflakeStageKmsConfig};
 
+mod resolver;
+
 use object_store::{azure::AzureCredential, RetryConfig, ObjectStore};
 use tokio::sync::Mutex;
 use std::sync::Arc;

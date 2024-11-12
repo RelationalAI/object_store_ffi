@@ -1422,6 +1422,7 @@ dependencies = [
  "flate2",
  "flume",
  "futures-util",
+ "hickory-resolver",
  "hyper",
  "metrics",
  "metrics-util",

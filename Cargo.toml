@@ -44,6 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # object_store = { version = "0.10.1", features = ["azure", "aws"] }
 # Pinned to a specific commit while waiting for upstream
 object_store = { git = "https://github.com/andrebsguedes/arrow-rs.git", tag = "v0.10.2-beta1", features = ["azure", "aws", "experimental-azure-list-offset", "experimental-arbitrary-list-prefix"] }
+hickory-resolver = "0.24"
 thiserror = "1"
 anyhow = { version = "1", features = ["backtrace"] }
 once_cell = "1.18"
@@ -81,6 +82,3 @@ openssl = { version = "0.10.66", features = ["vendored"] }
 
 [dev-dependencies]
 criterion = { version = "0.4", default-features = false, features = ["cargo_bench_support", "html_reports"] }
-
-[patch.crates-io]
-hickory-resolver = { git = "https://github.com/alexrenz/hickory-dns.git", branch = "larger-buffer-024" }
