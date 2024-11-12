@@ -344,8 +344,6 @@ pub(crate) async fn build_store_for_snowflake_stage(
     let client = SnowflakeClient::new(config.client_config);
     let info = client.current_upload_info(&config.stage).await?;
 
-    tracing::info!("stage info: {:?}", info);
-
     match info.stage_info.location_type.as_ref() {
         "S3" => {
             let (bucket, stage_prefix) = info.stage_info.location.split_once('/')
@@ -413,8 +411,6 @@ pub(crate) async fn build_store_for_snowflake_stage(
             let storage_account = info.stage_info.storage_account
                 .clone()
                 .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the storage account name"))?;
-
-            tracing::info!("set up azure store for container: {}, storage account: {}", container, storage_account);
 
             let provider = AzureStageCredentialProvider::new(&config.stage, client.clone());
 

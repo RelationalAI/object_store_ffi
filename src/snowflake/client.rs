@@ -182,10 +182,6 @@ impl TryFrom<&SnowflakeStageInfo> for NormalizedStageInfo {
             let storage_account = value.storage_account
                 .clone()
                 .ok_or_else(|| Error::invalid_response("Stage information from snowflake is missing the storage account name"))?;
-            tracing::info!(
-                "Azure. container: {}, prefix: {}, storage account: {}, end point: {:?}", 
-                container, prefix, storage_account, value.end_point.clone(),
-            );
             return Ok(NormalizedStageInfo::BlobStorage {
                 storage_account: storage_account,
                 container: container.to_string(),
