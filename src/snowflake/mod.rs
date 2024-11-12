@@ -414,11 +414,8 @@ pub(crate) async fn build_store_for_snowflake_stage(
 
             let provider = AzureStageCredentialProvider::new(&config.stage, client.clone());
 
-            match info.stage_info.test_endpoint.as_deref() {
-                Some(_) => {
-                    unimplemented!("test endpoint for azure blob storage is not supported");
-                }
-                None => {}
+            if info.stage_info.test_endpoint.is_some() {
+                unimplemented!("test endpoint for azure blob storage is not supported");
             }
 
             let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
