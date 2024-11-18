@@ -316,7 +316,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
 
         let scheme = match encryption_data.encryption_agent.encryption_algorithm.as_str() {
             "AES_CBC_128" => CryptoScheme::Aes128Cbc,
-            "AES_CBC_256" => CryptoScheme::Aes128Cbc, // TODO: discuss
+            "AES_CBC_256" => CryptoScheme::Aes128Cbc,
             v => unimplemented!("encryption algorithm `{}` not implemented", v)
         };
 
