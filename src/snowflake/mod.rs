@@ -422,7 +422,12 @@ pub(crate) async fn build_store_for_snowflake_stage(
 
             if let Some(test_endpoint) = &info.stage_info.test_endpoint {
                 builder = builder.with_endpoint(test_endpoint.to_string());
-                config_map.insert("allow_http".into(), "true".into());
+                let mut azurite_host = url::Url::parse(&test_endpoint)
+                    .map_err(Error::invalid_config_err("failed to parse azurite_host"))?;
+                azurite_host.set_path("");
+                unsafe { std::env::set_var("AZURITE_BLOB_STORAGE_URL", azurite_host.as_str()) };
+                config_map.insert("allow_invalid_certificates".into(), "true".into());
+                config_map.insert("azure_storage_use_emulator".into(), "true".into());
             }
 
             for (key, value) in config_map {
