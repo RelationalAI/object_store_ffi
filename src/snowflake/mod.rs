@@ -414,15 +414,16 @@ pub(crate) async fn build_store_for_snowflake_stage(
 
             let provider = AzureStageCredentialProvider::new(&config.stage, client.clone());
 
-            if info.stage_info.test_endpoint.is_some() {
-                unimplemented!("test endpoint for azure blob storage is not supported");
-            }
-
             let mut builder = object_store::azure::MicrosoftAzureBuilder::default()
                 .with_account(storage_account)
                 .with_container_name(container)
                 .with_credentials(Arc::new(provider))
                 .with_retry(retry_config);
+
+            if let Some(test_endpoint) = &info.stage_info.test_endpoint {
+                builder = builder.with_endpoint(test_endpoint.to_string());
+                config_map.insert("allow_http".into(), "true".into());
+            }
 
             for (key, value) in config_map {
                 builder = builder.with_config(key.parse()?, value);
