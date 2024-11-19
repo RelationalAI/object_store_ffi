@@ -243,6 +243,10 @@ pub(crate) fn decrypt(
     match material.scheme {
         CryptoScheme::Aes128Cbc => {
             let ContentCryptoMaterial { scheme, cek, iv, .. } = material;
+            // Tolerate zero length without padding
+            if ciphertext.len() == 0 {
+                return Ok(vec![]);
+            }
             Ok(symm::decrypt(scheme.cipher(), &cek, Some(&iv), ciphertext)?)
 
         },
@@ -250,7 +254,7 @@ pub(crate) fn decrypt(
             let ContentCryptoMaterial { scheme, cek, iv, aad, .. } = material;
             let aad_ref = aad.as_deref().unwrap_or_default();
             // Postfix tag
-            let tag_offset = ciphertext.len() - AES_GCM_TAG_BYTES;
+            let tag_offset = ciphertext.len().saturating_sub(AES_GCM_TAG_BYTES);
             let data = decrypt_aead(scheme.cipher(), &cek, Some(&iv), aad_ref, &ciphertext[..tag_offset], &ciphertext[tag_offset..])?;
             Ok(data)
         }
@@ -511,8 +515,15 @@ impl<R: AsyncRead> AsyncRead for CrypterReader<R> {
                     }
                     let amt = wrapped.filled().len();
                     this.inbuf.advance(amt);
-                    // maybe got some bytes, fill buffer
-                    State::Filling
+
+                    if amt == 0 && extract_tag_len == 0 && *this.mode == Mode::Decrypt {
+                        // Reader was empty and no tag to extract, on decryption
+                        // tolerate the missing padding and go to State::Done
+                        State::Done
+                    } else {
+                        // maybe got some bytes, fill buffer
+                        State::Filling
+                    }
 
                 }
                 State::Filling => {
@@ -762,6 +773,8 @@ impl<W: AsyncWrite> CrypterWriter<W> {
             // crypter was never updated, update it with empty slice to generate padding
             let amt = this.crypter.update(&[], this.buf.unfilled_mut())?;
             this.buf.advance(amt);
+            // just for completeness
+            *this.was_updated = true;
         }
         if *this.extract_tag_len > 0 {
             if this.tag_buf.filled().len() == *this.extract_tag_len {
@@ -829,10 +842,13 @@ impl<W: AsyncWrite> AsyncWrite for CrypterWriter<W> {
 
         // These bytes cannot be the tag, crypt them into main buffer
         let first = &buf[..last_bytes_offset];
-        let amt = this.crypter.update(first, this.buf.unfilled_mut())?;
-        this.buf.advance(amt);
-        // crypter was updated, needs to be finalized
-        *this.was_updated = true;
+
+        if first.len() > 0 {
+            let amt = this.crypter.update(first, this.buf.unfilled_mut())?;
+            this.buf.advance(amt);
+            // crypter was updated, needs to be finalized
+            *this.was_updated = true;
+        }
         Poll::Ready(Ok(first.len() + last.len()))
     }
 
@@ -843,10 +859,20 @@ impl<W: AsyncWrite> AsyncWrite for CrypterWriter<W> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if !self.finalized {
-            if self.buf.unfilled().len() < self.block_size + self.append_tag_len {
-                ready!(self.as_mut().flush_buf(cx))?;
+            if !self.was_updated && self.extract_tag_len == 0 && self.mode == Mode::Decrypt {
+                // Crypter was never updated and no tag to extract, on decryption
+                // tolerate the missing padding and mark it as finalized
+
+                *self
+                    .as_mut()
+                    .project()
+                    .finalized = true;
+            } else {
+                if self.buf.unfilled().len() < self.block_size + self.append_tag_len {
+                    ready!(self.as_mut().flush_buf(cx))?;
+                }
+                self.as_mut().finalize(cx)?;
             }
-            self.as_mut().finalize(cx)?;
         }
 
         ready!(self.as_mut().flush_buf(cx))?;
@@ -1063,6 +1089,23 @@ mod tests {
         assert_eq!(data, plaintext1);
         assert_eq!(data, plaintext2);
         assert_eq!(data, plaintext3);
+
+        // Must also decrypt empty slices without padding
+        let plaintext1 = decrypt(&data, &material).unwrap();
+
+        let mut reader = CrypterReader::new(data.as_slice(), Mode::Decrypt, &material).unwrap();
+        let mut plaintext2 = vec![];
+        reader.read_to_end(&mut plaintext2).await.unwrap();
+
+        let mut plaintext3 = vec![];
+        let mut writer = CrypterWriter::new(&mut plaintext3, Mode::Decrypt, &material).unwrap();
+        writer.write_all(&data).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(data, plaintext1);
+        assert_eq!(data, plaintext2);
+        assert_eq!(data, plaintext3);
     }
 
     #[tokio::test]
@@ -1103,6 +1146,19 @@ mod tests {
         assert_eq!(data, plaintext1);
         assert_eq!(data, plaintext2);
         assert_eq!(data, plaintext3);
+
+        // Cannot decrypt empty slice because the tag is required
+        assert!(decrypt(&data, &material).is_err());
+
+        let mut reader = CrypterReader::new(data.as_slice(), Mode::Decrypt, &material).unwrap();
+        let mut plaintext2 = vec![];
+        assert!(reader.read_to_end(&mut plaintext2).await.is_err());
+
+        let mut plaintext3 = vec![];
+        let mut writer = CrypterWriter::new(&mut plaintext3, Mode::Decrypt, &material).unwrap();
+        writer.write_all(&data).await.unwrap();
+        writer.flush().await.unwrap();
+        assert!(writer.shutdown().await.is_err());
     }
 
     #[test]
