@@ -245,6 +245,7 @@ impl Request {
 extern "C" {
     fn jl_adopt_thread() -> i32;
     fn jl_gc_safe_enter() -> i32;
+    fn jl_gc_disable_finalizers_internal() -> c_void;
 }
 
 // This is used to configure all aspects of the underlying
@@ -778,6 +779,7 @@ pub extern "C" fn start(
         {
             unsafe { jl_adopt_thread() };
             unsafe { jl_gc_safe_enter() };
+            unsafe { jl_gc_disable_finalizers_internal() };
         }
     });
 
