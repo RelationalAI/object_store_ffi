@@ -67,7 +67,7 @@ pub struct BulkResponse {
 unsafe impl Send for BulkResponse {}
 
 impl RawResponse for BulkResponse {
-    type Payload = Vec<BulkFailedEntry>;
+    type Payload = Vec<(Path, String)>;
     fn result_mut(&mut self) -> &mut CResult {
         &mut self.result
     }
@@ -80,6 +80,9 @@ impl RawResponse for BulkResponse {
     fn set_payload(&mut self, payload: Option<Self::Payload>) {
         match payload {
             Some(entries) => {
+                let entries = entries.into_iter().map(|(path, error_msg)| {
+                    BulkFailedEntry::new(path, error_msg)
+                }).collect::<Vec<BulkFailedEntry>>();
                 let entries_slice = entries.into_boxed_slice();
                 let entry_count = entries_slice.len() as u64;
                 let entries_ptr = entries_slice.as_ptr();
@@ -222,7 +225,8 @@ impl Client {
         counter!(metrics::total_delete_ops).increment(1);
         with_retries!(self, self.delete_impl(path).await)
     }
-    async fn bulk_delete_impl(&self, paths: &Vec<Path>) -> crate::Result<Vec<BulkFailedEntry>> {
+
+    async fn bulk_delete_impl(&self, paths: &Vec<Path>) -> crate::Result<Vec<(Path, String)>> {
         let stream = stream::iter(paths.iter().map(|path| Ok(path.clone()))).boxed();
         // Counter to keep track of the index of the path that failed to delete
         let counter = Arc::new(AtomicUsize::new(0));
@@ -231,26 +235,29 @@ impl Client {
                 let counter_clone = Arc::clone(&counter);
                 let index = counter_clone.fetch_add(1, Ordering::SeqCst);
                 match result {
-                    Ok(_) => None,
+                    Ok(path) => {
+                        println!("H2 Path found: {}", path);
+                        None
+                    },
                     Err(e) => match e {
                         // We treat not found as success because AWS S3 does not return an error
                         // if the object does not exist
-                        object_store::Error::NotFound { path: _, source: _ } => {
+                        object_store::Error::NotFound { path: _, source } => {
+                            println!("H3 Path not found: {} {}", paths[index], source);
                             None
                         },
                         _ => {
-                            Some(BulkFailedEntry::new(
-                                paths[index].clone(), e.to_string())
-                            )
+                            println!("H2 Path error: {} \n {}", paths[index].clone(), e.to_string());
+                            Some((paths[index].clone(), e.to_string()))
                         }
                     },
                 }
             })
-            .collect::<Vec<BulkFailedEntry>>()
+            .collect::<Vec<(Path, String)>>()
             .await;
         Ok(bulk_failed_entries)
     }
-    pub async fn bulk_delete(&self, paths: Vec<Path>) -> crate::Result<Vec<BulkFailedEntry>> {
+    pub async fn bulk_delete(&self, paths: Vec<Path>) -> crate::Result<Vec<(Path, String)>> {
         counter!(metrics::total_bulk_delete_ops).increment(1);
         with_retries!(self, self.bulk_delete_impl(&paths).await)
     }
