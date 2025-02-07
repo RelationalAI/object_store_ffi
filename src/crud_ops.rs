@@ -236,18 +236,15 @@ impl Client {
                 let index = counter_clone.fetch_add(1, Ordering::SeqCst);
                 match result {
                     Ok(path) => {
-                        println!("H2 Path found: {}", path);
                         None
                     },
                     Err(e) => match e {
                         // We treat not found as success because AWS S3 does not return an error
                         // if the object does not exist
                         object_store::Error::NotFound { path: _, source } => {
-                            println!("H3 Path not found: {} {}", paths[index], source);
                             None
                         },
                         _ => {
-                            println!("H2 Path error: {} \n {}", paths[index].clone(), e.to_string());
                             Some((paths[index].clone(), e.to_string()))
                         }
                     },
@@ -255,7 +252,17 @@ impl Client {
             })
             .collect::<Vec<(Path, String)>>()
             .await;
-        Ok(bulk_failed_entries)
+        // Rail guard to catch generic errors
+        let callbacks_called = counter.load(Ordering::SeqCst);
+        if callbacks_called < paths.len() {
+            if callbacks_called == 0 {
+                Err(crate::Error::invalid_response("Some paths were not deleted"))
+            } else {
+                Err(crate::Error::invalid_response(bulk_failed_entries[0].1.clone()))
+            }
+        } else {
+            Ok(bulk_failed_entries)
+        }
     }
     pub async fn bulk_delete(&self, paths: Vec<Path>) -> crate::Result<Vec<(Path, String)>> {
         counter!(metrics::total_bulk_delete_ops).increment(1);
