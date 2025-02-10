@@ -46,7 +46,7 @@ impl RawResponse for Response {
 
 // ================================================================================================
 // Boiler plate code for FFI structs
-// Any non-copy fields of ListEntry must be properly destroyed on destroy_list_entries
+// Any non-copy fields of BulkFailedEntry must be properly destroyed on destroy_bulk_failed_entries
 #[repr(C)]
 pub struct BulkFailedEntry {
     path: *const c_char,
@@ -67,7 +67,7 @@ pub struct BulkResponse {
 unsafe impl Send for BulkResponse {}
 
 impl RawResponse for BulkResponse {
-    type Payload = Vec<(Path, String)>;
+    type Payload = Vec<(Path, crate::Error)>;
     fn result_mut(&mut self) -> &mut CResult {
         &mut self.result
     }
@@ -80,8 +80,8 @@ impl RawResponse for BulkResponse {
     fn set_payload(&mut self, payload: Option<Self::Payload>) {
         match payload {
             Some(entries) => {
-                let entries = entries.into_iter().map(|(path, error_msg)| {
-                    BulkFailedEntry::new(path, error_msg)
+                let entries = entries.into_iter().map(|(path, error)| {
+                    BulkFailedEntry::new(path, error.to_string())
                 }).collect::<Vec<BulkFailedEntry>>();
                 let entries_slice = entries.into_boxed_slice();
                 let entry_count = entries_slice.len() as u64;
@@ -106,7 +106,7 @@ pub extern "C" fn destroy_bulk_failed_entries(
 ) -> CResult {
     let boxed_slice = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(entries, entry_count as usize)) };
     for entry in &*boxed_slice {
-        // Safety: must properly drop all allocated fields from ListEntry here
+        // Safety: must properly drop all allocated fields from BulkFailedEntry here
         let _ = unsafe { CString::from_raw(entry.path.cast_mut()) };
     }
     CResult::Ok
@@ -226,45 +226,47 @@ impl Client {
         with_retries!(self, self.delete_impl(path).await)
     }
 
-    async fn bulk_delete_impl(&self, paths: &Vec<Path>) -> crate::Result<Vec<(Path, String)>> {
+    async fn bulk_delete_impl(&self, paths: &Vec<Path>) -> crate::Result<Vec<(Path, crate::Error)>> {
         let stream = stream::iter(paths.iter().map(|path| Ok(path.clone()))).boxed();
-        // Counter to keep track of the index of the path that failed to delete
-        let counter = Arc::new(AtomicUsize::new(0));
-        let bulk_failed_entries = self.store.delete_stream(stream)
-            .filter_map(|result| async {
-                let counter_clone = Arc::clone(&counter);
-                let index = counter_clone.fetch_add(1, Ordering::SeqCst);
-                match result {
-                    Ok(path) => {
+        let indexed_results = self.store.delete_stream(stream)
+            .enumerate()
+            .filter_map(|(index, result)| async move {
+                Some((index, result))
+            }).collect::<Vec<(usize, Result<Path, object_store::Error>)>>().await;
+        // We need to count the number of callbacks called to determine if we need to raise an error
+        // if some paths were not processed at all.
+        let callbacks_called = indexed_results.len();
+        let bulk_failed_entries = indexed_results.into_iter().filter_map(|(index, result)| {
+            match result {
+                Ok(_) => {
+                    None
+                },
+                Err(e) => match e {
+                    // We treat not found as success because AWS S3 does not return an error
+                    // if the object does not exist
+                    object_store::Error::NotFound { .. } => {
                         None
                     },
-                    Err(e) => match e {
-                        // We treat not found as success because AWS S3 does not return an error
-                        // if the object does not exist
-                        object_store::Error::NotFound { path: _, source } => {
-                            None
-                        },
-                        _ => {
-                            Some((paths[index].clone(), e.to_string()))
-                        }
-                    },
-                }
-            })
-            .collect::<Vec<(Path, String)>>()
-            .await;
+                    _ => {
+                        Some((paths[index].clone(), e.into()))
+                    }
+                },
+            }
+        }).collect::<Vec<(Path, crate::Error)>>();
+
         // Rail guard to catch generic errors
-        let callbacks_called = counter.load(Ordering::SeqCst);
         if callbacks_called < paths.len() {
             if callbacks_called == 0 {
                 Err(crate::Error::invalid_response("Some paths were not deleted"))
             } else {
-                Err(crate::Error::invalid_response(bulk_failed_entries[0].1.clone()))
+                let error_string = bulk_failed_entries[0].1.to_string();
+                Err(crate::Error::invalid_response(error_string))
             }
         } else {
             Ok(bulk_failed_entries)
         }
     }
-    pub async fn bulk_delete(&self, paths: Vec<Path>) -> crate::Result<Vec<(Path, String)>> {
+    pub async fn bulk_delete(&self, paths: Vec<Path>) -> crate::Result<Vec<(Path, crate::Error)>> {
         counter!(metrics::total_bulk_delete_ops).increment(1);
         with_retries!(self, self.bulk_delete_impl(&paths).await)
     }
@@ -383,13 +385,10 @@ export_queued_op!(
     bulk_delete,
     BulkResponse,
     |config, response| {
-        let mut paths_vec:Vec<Path> = Vec::new();
-        for i in 0..num_paths as isize {
-            let path_ptr = unsafe { *path_c_array.offset(i)};
-            let path = unsafe { std::ffi::CStr::from_ptr(path_ptr) };
-            let path = unsafe { cstr_to_path(path) };
-            paths_vec.push(path);
-        }
+        let slice: &[*const c_char] = unsafe { std::slice::from_raw_parts(path_c_array, num_paths) };
+        let paths_vec: Vec<Path> = slice.iter().map(|ptr| {
+            unsafe { cstr_to_path(std::ffi::CStr::from_ptr(ptr.clone())) }
+        }).collect();
         Ok(Request::BulkDelete(paths_vec, config, response))
     },
     path_c_array: *const *const c_char, num_paths: usize
