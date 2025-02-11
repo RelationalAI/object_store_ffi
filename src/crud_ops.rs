@@ -5,7 +5,7 @@ use ::metrics::counter;
 use object_store::{path::Path, ObjectStore};
 
 use tokio_util::io::StreamReader;
-use std::{ffi::{c_char, c_void, CString}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
+use std::{ffi::{c_char, c_void, CString}, sync::Arc};
 use futures_util::{stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -60,6 +60,7 @@ pub struct BulkResponse {
     result: CResult,
     failed_entries: *const BulkFailedEntry,
     failed_count: u64,
+    // Generic error message for the whole operation. Not null implies failed_count = 0
     error_message: *mut c_char,
     context: *const Context
 }
@@ -108,6 +109,7 @@ pub extern "C" fn destroy_bulk_failed_entries(
     for entry in &*boxed_slice {
         // Safety: must properly drop all allocated fields from BulkFailedEntry here
         let _ = unsafe { CString::from_raw(entry.path.cast_mut()) };
+        let _ = unsafe { CString::from_raw(entry.error_message.cast_mut()) };
     }
     CResult::Ok
 }
