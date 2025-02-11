@@ -228,10 +228,10 @@ impl Client {
         with_retries!(self, self.delete_impl(path).await)
     }
 
-    async fn bulk_delete_impl(&self, paths: &Vec<Path>) -> crate::Result<Vec<(Path, crate::Error)>> {
+    async fn bulk_delete_impl(&self, og_paths: &Vec<Path>) -> crate::Result<Vec<(Path, crate::Error)>> {
         // Add the client prefix to the provided paths if needed
-        let paths = paths.into_iter().map(|path| self.full_path(path)).collect::<Vec<Path>>();
-        let stream = stream::iter(paths.iter().map(|path| Ok(path.clone()))).boxed();
+        let prefixed_paths = og_paths.into_iter().map(|path| self.full_path(path)).collect::<Vec<Path>>();
+        let stream = stream::iter(prefixed_paths.iter().map(|path| Ok(path.clone()))).boxed();
         let results = self.store.delete_stream(stream)
             .collect::<Vec<_>>().await;
         // We count the number of results to raise an error if some paths were not
@@ -239,8 +239,8 @@ impl Client {
         let num_results = results.len();
         let failures = results
             .into_iter()
-            .enumerate()
-            .filter_map(|(index, result)| {
+            .zip(og_paths.into_iter()) // Stops at the shorter iterator
+            .filter_map(|(result, og_path)| {
                 match result {
                     Ok(_) => {
                         None
@@ -252,14 +252,14 @@ impl Client {
                             None
                         },
                         _ => {
-                            Some((paths[index].clone(), e.into()))
+                            Some((og_path.clone(), e.into()))
                         }
                     },
                 }
             }).collect::<Vec<(Path, crate::Error)>>();
 
         // Rail guard to catch generic errors
-        if num_results < paths.len() {
+        if num_results < og_paths.len() {
             if num_results == 0 {
                 tracing::warn!("delete_stream returned zero results");
                 Err(crate::Error::invalid_response("Some paths were not deleted"))
