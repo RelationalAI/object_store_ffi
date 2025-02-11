@@ -230,8 +230,8 @@ impl Client {
         let stream = stream::iter(paths.iter().map(|path| Ok(path.clone()))).boxed();
         let results = self.store.delete_stream(stream)
             .collect::<Vec<_>>().await;
-        // We need to count the number of callbacks called to determine if we need to raise an error
-        // if some paths were not processed at all.
+        // We count the number of results to raise an error if some paths were not
+        // successfully processed at all.
         let num_results = results.len();
         let failures = results
             .into_iter()
@@ -257,9 +257,11 @@ impl Client {
         // Rail guard to catch generic errors
         if num_results < paths.len() {
             if num_results == 0 {
+                tracing::warn!("delete_stream returned zero results");
                 Err(crate::Error::invalid_response("Some paths were not deleted"))
             } else {
                 let error_string = failures[0].1.to_string();
+                tracing::warn!("delete_stream returned a single generic error: {}", error_string);
                 Err(crate::Error::invalid_response(error_string))
             }
         } else {
