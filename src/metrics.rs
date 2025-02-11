@@ -131,6 +131,7 @@ declare_metrics! {
     Counter, total_get_ops, Unit::Count, "Total amount of object GET operations";
     Counter, total_put_ops, Unit::Count, "Total amount of object PUT operations";
     Counter, total_delete_ops, Unit::Count, "Total amount of object DELETE operations";
+    Counter, total_bulk_delete_ops, Unit::Count, "Total amount of object bulk DELETE operations";
     Counter, total_keyring_get, Unit::Count, "Total amount of key fetches from in-memory keyring";
     Counter, total_keyring_miss, Unit::Count, "Total amount of misses while fetching key from keyring";
     Counter, total_fetch_upload_info, Unit::Count, "Total amount of Snowflake stage info requests";

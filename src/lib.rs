@@ -32,7 +32,7 @@ mod list;
 use list::{ListResponse, ListStreamResponse};
 
 mod crud_ops;
-use crud_ops::Response;
+use crud_ops::{BulkResponse, Response};
 
 mod stream;
 use stream::{GetStreamResponse, PutStreamResponse};
@@ -193,6 +193,7 @@ enum Request {
     Get(Path, &'static mut [u8], &'static RawConfig, ResponseGuard<Response>),
     Put(Path, &'static [u8], &'static RawConfig, ResponseGuard<Response>),
     Delete(Path, &'static RawConfig, ResponseGuard<Response>),
+    BulkDelete(Vec<Path>, &'static RawConfig, ResponseGuard<BulkResponse>),
     List(Path, Option<Path>, &'static RawConfig, ResponseGuard<ListResponse>),
     ListStream(Path, Option<Path>, &'static RawConfig, ResponseGuard<ListStreamResponse>),
     GetStream(Path, usize, Compression, &'static RawConfig, ResponseGuard<GetStreamResponse>),
@@ -207,6 +208,7 @@ impl Request {
             Request::Get( .. , response) => response.cancelled(),
             Request::Put( .. , response) => response.cancelled(),
             Request::Delete( .. , response) => response.cancelled(),
+            Request::BulkDelete( .. , response) => response.cancelled(),
             Request::List( .. , response) => response.cancelled(),
             Request::ListStream( .. , response) => response.cancelled(),
             Request::GetStream( .. , response) => response.cancelled(),
@@ -218,6 +220,7 @@ impl Request {
             Request::Get( .. , response) => response.into_error(error),
             Request::Put( .. , response) => response.into_error(error),
             Request::Delete( .. , response) => response.into_error(error),
+            Request::BulkDelete( .. , response) => response.into_error(error),
             Request::List( .. , response) => response.into_error(error),
             Request::ListStream( .. , response) => response.into_error(error),
             Request::GetStream( .. , response) => response.into_error(error),
@@ -229,6 +232,7 @@ impl Request {
             Request::Get( .. , config, _response) => config,
             Request::Put( .. , config, _response) => config,
             Request::Delete( .. , config, _response) => config,
+            Request::BulkDelete( .. , config, _response) => config,
             Request::List( .. , config, _response) => config,
             Request::ListStream( .. , config, _response) => config,
             Request::GetStream( .. , config, _response) => config,
@@ -848,6 +852,9 @@ pub extern "C" fn start(
                         }
                         Request::Delete(path, _config, response) => {
                             with_cancellation!(client.delete(&path), response, false);
+                        }
+                        Request::BulkDelete(paths, _config, response) => {
+                            with_cancellation!(client.bulk_delete(paths), response, false);
                         }
                         Request::List(prefix, offset, _config, response) => {
                             with_cancellation!(client.list(&prefix, offset.as_ref()), response);
