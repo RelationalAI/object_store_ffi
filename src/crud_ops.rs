@@ -1,4 +1,4 @@
-use crate::{duration_on_drop, encryption::{encrypt, CrypterReader, CrypterWriter, Mode}, error::Kind as ErrorKind, export_queued_op, metrics, util::{cstr_to_path, BufWriter}, with_retries, BoxedReader, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, SQ};
+use crate::{duration_on_drop, encryption::{encrypt, CrypterReader, CrypterWriter, Mode}, error::Kind as ErrorKind, export_queued_op, metrics, util::{cstr_to_path, string_to_path, BufWriter}, with_retries, BoxedReader, BoxedUpload, CResult, Client, Context, NotifyGuard, RawConfig, RawResponse, Request, ResponseGuard, SQ};
 
 use bytes::Bytes;
 use ::metrics::counter;
@@ -230,7 +230,7 @@ impl Client {
 
     async fn bulk_delete_impl(&self, paths: &Vec<Path>) -> crate::Result<Vec<(Path, crate::Error)>> {
         // Add the client prefix to the provided paths if needed
-        let paths = paths.into_iter().map(|path| self.full_path(path)).collect::<Vec<Path>>();
+        let prefixed_paths = paths.into_iter().map(|path| self.full_path(path)).collect::<Vec<Path>>();
         let stream = stream::iter(paths.iter().map(|path| Ok(path.clone()))).boxed();
         let results = self.store.delete_stream(stream)
             .collect::<Vec<_>>().await;
@@ -239,8 +239,8 @@ impl Client {
         let num_results = results.len();
         let failures = results
             .into_iter()
-            .enumerate()
-            .filter_map(|(index, result)| {
+            .zip(prefixed_paths.into_iter()) // Stops at the shorter iterator
+            .filter_map(|(result, path)| {
                 match result {
                     Ok(_) => {
                         None
@@ -252,7 +252,17 @@ impl Client {
                             None
                         },
                         _ => {
-                            Some((paths[index].clone(), e.into()))
+                            match self.config.prefix.as_ref() {
+                                None => Some((path, e.into())),
+                                Some(prefix_str) => {
+                                    if let Some(stripped_str) = path.as_ref().strip_prefix(prefix_str) {
+                                        let truncated = unsafe { string_to_path(stripped_str.to_string()) };
+                                        Some((truncated, e.into()))
+                                    } else {
+                                        Some((path, e.into()))
+                                    }
+                                }
+                            }
                         }
                     },
                 }
