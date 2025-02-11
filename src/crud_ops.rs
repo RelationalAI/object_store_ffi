@@ -229,6 +229,8 @@ impl Client {
     }
 
     async fn bulk_delete_impl(&self, paths: &Vec<Path>) -> crate::Result<Vec<(Path, crate::Error)>> {
+        // Add the client prefix to the provided paths if needed
+        let paths = paths.into_iter().map(|path| self.full_path(path)).collect::<Vec<Path>>();
         let stream = stream::iter(paths.iter().map(|path| Ok(path.clone()))).boxed();
         let results = self.store.delete_stream(stream)
             .collect::<Vec<_>>().await;
