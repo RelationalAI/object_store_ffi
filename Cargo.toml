@@ -43,7 +43,7 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "hickory-dns"] }
 # object_store = { version = "0.10.1", features = ["azure", "aws"] }
 # Pinned to a specific commit while waiting for upstream
-object_store = { git = "https://github.com/RelationalAI/arrow-rs.git", branch = "object_store_0.11.3-beta1", features = ["azure", "aws", "experimental-azure-list-offset", "experimental-arbitrary-list-prefix"] }
+object_store = { git = "https://github.com/RelationalAI/arrow-rs.git", tag = "v0.11.3-beta1", features = ["azure", "aws", "experimental-azure-list-offset", "experimental-arbitrary-list-prefix"] }
 hickory-resolver = "0.24"
 thiserror = "1"
 anyhow = { version = "1", features = ["backtrace"] }
