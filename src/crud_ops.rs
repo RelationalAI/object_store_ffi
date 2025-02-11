@@ -228,42 +228,42 @@ impl Client {
 
     async fn bulk_delete_impl(&self, paths: &Vec<Path>) -> crate::Result<Vec<(Path, crate::Error)>> {
         let stream = stream::iter(paths.iter().map(|path| Ok(path.clone()))).boxed();
-        let indexed_results = self.store.delete_stream(stream)
-            .enumerate()
-            .filter_map(|(index, result)| async move {
-                Some((index, result))
-            }).collect::<Vec<(usize, Result<Path, object_store::Error>)>>().await;
+        let results = self.store.delete_stream(stream)
+            .collect::<Vec<_>>().await;
         // We need to count the number of callbacks called to determine if we need to raise an error
         // if some paths were not processed at all.
-        let callbacks_called = indexed_results.len();
-        let bulk_failed_entries = indexed_results.into_iter().filter_map(|(index, result)| {
-            match result {
-                Ok(_) => {
-                    None
-                },
-                Err(e) => match e {
-                    // We treat not found as success because AWS S3 does not return an error
-                    // if the object does not exist
-                    object_store::Error::NotFound { .. } => {
+        let num_results = results.len();
+        let failures = results
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, result)| {
+                match result {
+                    Ok(_) => {
                         None
                     },
-                    _ => {
-                        Some((paths[index].clone(), e.into()))
-                    }
-                },
-            }
-        }).collect::<Vec<(Path, crate::Error)>>();
+                    Err(e) => match e {
+                        // We treat not found as success because AWS S3 does not return an error
+                        // if the object does not exist
+                        object_store::Error::NotFound { .. } => {
+                            None
+                        },
+                        _ => {
+                            Some((paths[index].clone(), e.into()))
+                        }
+                    },
+                }
+            }).collect::<Vec<(Path, crate::Error)>>();
 
         // Rail guard to catch generic errors
-        if callbacks_called < paths.len() {
-            if callbacks_called == 0 {
+        if num_results < paths.len() {
+            if num_results == 0 {
                 Err(crate::Error::invalid_response("Some paths were not deleted"))
             } else {
-                let error_string = bulk_failed_entries[0].1.to_string();
+                let error_string = failures[0].1.to_string();
                 Err(crate::Error::invalid_response(error_string))
             }
         } else {
-            Ok(bulk_failed_entries)
+            Ok(failures)
         }
     }
     pub async fn bulk_delete(&self, paths: Vec<Path>) -> crate::Result<Vec<(Path, crate::Error)>> {
