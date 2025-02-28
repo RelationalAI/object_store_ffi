@@ -277,15 +277,17 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "chrono"
-version = "0.4.37"
+version = "0.4.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a0d04d43504c61aa6c7531f1871dd0d418d91130162063b789da00fd7057a5e"
+checksum = "1a7964611d71df112cb1730f2ee67324fcf4d0fc6606acbbe9bfe06df124637c"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
- "windows-targets 0.52.0",
+ "wasm-bindgen",
+ "windows-link",
 ]
 
 [[package]]
@@ -1402,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "object_store_ffi"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1411,6 +1413,7 @@ dependencies = [
  "backoff",
  "base64",
  "bytes",
+ "chrono",
  "clap 4.5.20",
  "criterion",
  "crossbeam-queue",
@@ -2646,6 +2649,12 @@ checksum = "f1f8cf84f35d2db49a46868f947758c7a1138116f7fac3bc844f43ade1292e64"
 dependencies = [
  "windows-targets 0.48.5",
 ]
+
+[[package]]
+name = "windows-link"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dccfd733ce2b1753b03b6d3c65edf020262ea35e20ccdf3e288043e6dd620e3"
 
 [[package]]
 name = "windows-sys"

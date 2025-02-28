@@ -1,6 +1,6 @@
 [package]
 name = "object_store_ffi"
-version = "0.12.2"
+version = "0.12.3"
 edition = "2021"
 
 [[bench]]
@@ -71,6 +71,7 @@ metrics = "0.23.0"
 metrics-util = "0.17.0"
 quanta = "0.12.3"
 walkdir = "2.5.0"
+chrono = "0.4.40"
 
 clap = { version = "4.4", features = ["derive", "env"], optional = true }
 

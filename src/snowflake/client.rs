@@ -662,6 +662,13 @@ impl SnowflakeClient {
         }).await?;
         Ok(stage_info)
     }
+    pub(crate) async fn refresh_upload_info(&self, stage: impl AsRef<str>) -> crate::Result<Arc<SnowflakeUploadData>> {
+        let stage = stage.as_ref();
+        let info = self.fetch_upload_info(stage).await?;
+        let stage_info = Arc::new(info);
+        self.stage_info_cache.insert(stage.to_string(), Arc::clone(&stage_info)).await;
+        Ok(stage_info)
+    }
 }
 
 #[cfg(test)]

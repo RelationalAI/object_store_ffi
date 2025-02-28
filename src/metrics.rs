@@ -135,7 +135,8 @@ declare_metrics! {
     Counter, total_keyring_get, Unit::Count, "Total amount of key fetches from in-memory keyring";
     Counter, total_keyring_miss, Unit::Count, "Total amount of misses while fetching key from keyring";
     Counter, total_fetch_upload_info, Unit::Count, "Total amount of Snowflake stage info requests";
-    Counter, total_fetch_path_info, Unit::Count, "Total amount of Snowflake GET requests to fetch keys"
+    Counter, total_fetch_path_info, Unit::Count, "Total amount of Snowflake GET requests to fetch keys";
+    Counter, total_sf_az_expired_tokens, Unit::Count, "Total amount of retries due to expired Azure tokens from Snowflake"
 }
 
 static METRICS_SNAPSHOTTER: OnceCell<metrics_util::debugging::Snapshotter> = OnceCell::new();

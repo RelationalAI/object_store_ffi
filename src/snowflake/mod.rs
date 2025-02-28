@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
+use chrono::prelude::*;
 
 #[derive(Debug)]
 pub(crate) struct SnowflakeS3Extension {
@@ -134,13 +135,12 @@ impl Extension for SnowflakeAzureExtension {
 #[derive(Debug)]
 pub(crate) struct AzureStageCredentialProvider {
     stage: String,
-    client: Arc<SnowflakeClient>,
-    cached: Mutex<Option<Arc<object_store::azure::AzureCredential>>>
+    client: Arc<SnowflakeClient>
 }
 
 impl AzureStageCredentialProvider {
     pub(crate) fn new(stage: impl AsRef<str>, client: Arc<SnowflakeClient>) -> AzureStageCredentialProvider {
-        AzureStageCredentialProvider { stage: stage.as_ref().to_string(), client, cached: Mutex::new(None) }
+        AzureStageCredentialProvider { stage: stage.as_ref().to_string(), client }
     }
 }
 
@@ -148,49 +148,76 @@ impl AzureStageCredentialProvider {
 impl object_store::CredentialProvider for AzureStageCredentialProvider {
     type Credential = object_store::azure::AzureCredential;
     async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
-        let info = self.client.current_upload_info(&self.stage).await
-            .map_err(|e| {
-                object_store::Error::Generic {
+        let mut expiration_retries = 3;
+        'retry: loop {
+            let info = self.client.current_upload_info(&self.stage).await
+                .map_err(|e| {
+                    object_store::Error::Generic {
+                        store: "MicrosoftAzure",
+                        source: e.into()
+                    }
+                })?;
+
+            if info.stage_info.location_type != "AZURE" {
+                return Err(object_store::Error::Generic {
+                    store: "MicrosoftAzure",
+                    source: Error::invalid_response("Location type must be AZURE for this provider").into()
+                })
+            }
+
+            let new_creds = info.stage_info.creds.as_azure()
+                .map_err(|e| object_store::Error::Generic {
                     store: "MicrosoftAzure",
                     source: e.into()
+                })?;
+
+
+            let token_bytes = new_creds.azure_sas_token.trim_start_matches('?').as_bytes();
+            let new_pairs: Vec<_> = url::form_urlencoded::parse(token_bytes)
+                .into_owned()
+                .collect();
+
+            if let Some((_, exp_str)) = new_pairs.iter().find(|(a, _)| a == "se") {
+                if let Ok(exp_time) = exp_str.parse::<DateTime<Utc>>() {
+                    if exp_time < Utc::now() - std::time::Duration::from_secs(300) {
+                        let _ = self.client.refresh_upload_info(&self.stage).await
+                            .map_err(|e| object_store::Error::Generic {
+                                store: "MicrosoftAzure",
+                                source: e.into()
+                            })?;
+                        if expiration_retries > 0 {
+                            expiration_retries -= 1;
+                            continue 'retry;
+                        } else {
+                            return Err(object_store::Error::Generic {
+                                store: "MicrosoftAzure",
+                                source: Error::invalid_response(
+                                    format!("Got expired Azure token from Snowflake after 3 retries (exp: {exp_str})")
+                                ).into()
+                            })
+                        }
+                    }
+                } else {
+                    return Err(object_store::Error::Generic {
+                        store: "MicrosoftAzure",
+                        source: Error::invalid_response(
+                            "Unable to parse expiration from Azure SAS token"
+                            ).into()
+                    })
                 }
-            })?;
-
-        if info.stage_info.location_type != "AZURE" {
-            return Err(object_store::Error::Generic {
-                store: "MicrosoftAzure",
-                source: Error::invalid_response("Location type must be AZURE for this provider").into()
-            })
-        }
-
-        let new_creds = info.stage_info.creds.as_azure()
-            .map_err(|e| object_store::Error::Generic {
-                store: "MicrosoftAzure",
-                source: e.into()
-            })?;
-        
-
-        let token_bytes = new_creds.azure_sas_token.trim_start_matches('?').as_bytes();
-        let new_pairs = url::form_urlencoded::parse(token_bytes)
-            .into_owned()
-            .collect();
-        
-        let mut locked = self.cached.lock().await;
-
-        match locked.as_ref() {
-            Some(creds) => {
-                if matches!(creds.as_ref(), AzureCredential::SASToken(pairs) if *pairs == new_pairs) {
-                    return Ok(Arc::clone(creds));
-                }
+            } else {
+                return Err(object_store::Error::Generic {
+                    store: "MicrosoftAzure",
+                    source: Error::invalid_response(
+                        "Missing expiration from Azure SAS token"
+                        ).into()
+                })
             }
-            _ => {}
+
+            let creds = Arc::new(AzureCredential::SASToken(new_pairs));
+
+            return Ok(creds)
         }
-
-        let creds = Arc::new(AzureCredential::SASToken(new_pairs));
-
-        *locked = Some(Arc::clone(&creds));
-
-        Ok(creds)
     }
 }
 
@@ -443,9 +470,9 @@ pub(crate) async fn build_store_for_snowflake_stage(
             let crypto_material_provider = if info.stage_info.is_client_side_encrypted {
                 let kms_config = config.kms_config.unwrap_or_default();
                 let stage_kms = SnowflakeStageAzureKms::new(
-                    client.clone(), 
-                    &config.stage, 
-                    stage_prefix, 
+                    client.clone(),
+                    &config.stage,
+                    stage_prefix,
                     kms_config,
                 );
                 Some::<Arc<dyn CryptoMaterialProvider>>(Arc::new(stage_kms))
