@@ -179,7 +179,7 @@ impl object_store::CredentialProvider for AzureStageCredentialProvider {
 
             if let Some((_, exp_str)) = new_pairs.iter().find(|(a, _)| a == "se") {
                 if let Ok(exp_time) = exp_str.parse::<DateTime<Utc>>() {
-                    if exp_time < Utc::now() - std::time::Duration::from_secs(300) {
+                    if exp_time < Utc::now() + std::time::Duration::from_secs(300) {
                         let _ = self.client.refresh_upload_info(&self.stage).await
                             .map_err(|e| object_store::Error::Generic {
                                 store: "MicrosoftAzure",
@@ -187,6 +187,7 @@ impl object_store::CredentialProvider for AzureStageCredentialProvider {
                             })?;
                         if expiration_retries > 0 {
                             expiration_retries -= 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue 'retry;
                         } else {
                             return Err(object_store::Error::Generic {
