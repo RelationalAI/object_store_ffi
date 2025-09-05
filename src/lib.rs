@@ -48,7 +48,7 @@ mod encryption;
 // Our global variables needed by our library at runtime. Note that we follow Rust's
 // safety rules here by making them immutable with write-exactly-once semantics using
 // either Lazy or OnceCell.
-static RT: OnceCell<Runtime> = OnceCell::new();
+pub static RT: OnceCell<Runtime> = OnceCell::new();
 // A channel (i.e., a queue) where the GET/PUT requests from Julia are placed and where
 // our dispatch task pulls requests.
 static SQ: OnceCell<flume::Sender<Request>> = OnceCell::new();
@@ -60,8 +60,8 @@ static CLIENTS: OnceCell<Cache<u64, Client>> = OnceCell::new();
 // Contains configuration items that are set during initialization and do not change.
 static STATIC_CONFIG: OnceCell<StaticConfig> = OnceCell::new();
 
-type ResultCallback = unsafe extern "C" fn(task: *const c_void) -> i32;
-static RESULT_CB: OnceCell<ResultCallback> = OnceCell::new();
+pub type ResultCallback = unsafe extern "C" fn(task: *const c_void) -> i32;
+pub static RESULT_CB: OnceCell<ResultCallback> = OnceCell::new();
 
 type PanicCallback = unsafe extern "C" fn() -> i32;
 
@@ -140,21 +140,21 @@ pub trait RawResponse {
     fn set_payload(&mut self, payload: Option<Self::Payload>);
 }
 
-struct ResponseGuard<T: RawResponse + 'static> {
+pub struct ResponseGuard<T: RawResponse + 'static> {
     response: &'static mut T,
     context: Arc<Context>,
     handle: *const c_void
 }
 
 impl<T: RawResponse> ResponseGuard<T> {
-    unsafe fn new(response_ptr: *mut T, handle: *const c_void) -> Self {
+    pub unsafe fn new(response_ptr: *mut T, handle: *const c_void) -> Self {
         let response = unsafe { &mut (*response_ptr) };
         *response.result_mut() = CResult::Uninitialized;
         let context = Arc::new(Context::default());
         *response.context_mut() = Arc::into_raw(context.clone());
         ResponseGuard { response, context, handle }
     }
-    pub(crate) fn success(self, payload: impl Into<T::Payload>) {
+    pub fn success(self, payload: impl Into<T::Payload>) {
         *self.response.result_mut() = CResult::Ok;
         self.response.set_payload(Some(payload.into()));
         *self.response.error_message_mut() = std::ptr::null_mut();
@@ -715,7 +715,7 @@ export_runtime_op!(
     config: *const RawConfig
 );
 
-trait NotifyGuard {
+pub trait NotifyGuard {
     fn is_uninitialized(&mut self) -> bool;
     fn condition_handle(&self) -> *const c_void;
     fn context(&self) -> &Context {
