@@ -36,11 +36,11 @@ sfcp = ["clap"]
 [dependencies]
 tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
-bytes = "1.0"
+bytes = "1.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "hickory-dns"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "hickory-dns", "gzip"] }
 # object_store = { version = "0.10.1", features = ["azure", "aws"] }
 # Pinned to a specific commit while waiting for upstream
 object_store = { git = "https://github.com/RelationalAI/arrow-rs.git", tag = "v0.11.3-beta1", features = ["azure", "aws", "experimental-azure-list-offset", "experimental-arbitrary-list-prefix"] }

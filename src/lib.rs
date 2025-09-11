@@ -3,6 +3,7 @@ static GLOBAL: metrics::InstrumentedAllocator = metrics::InstrumentedAllocator {
 
 use encryption::CryptoMaterialProvider;
 use error::Error;
+use futures_util::stream::BoxStream;
 use object_store::RetryConfig;
 use once_cell::sync::OnceCell;
 use tokio::io::AsyncRead;
@@ -44,6 +45,8 @@ mod snowflake;
 use snowflake::build_store_for_snowflake_stage;
 
 mod encryption;
+
+mod query;
 
 // Our global variables needed by our library at runtime. Note that we follow Rust's
 // safety rules here by making them immutable with write-exactly-once semantics using
@@ -354,6 +357,12 @@ pub(crate) trait Extension: std::fmt::Debug + Send + Sync + 'static {
     async fn current_stage_info(&self) -> crate::Result<String> {
         return Err(Error::not_implemented("current_stage_info is not implemented for this client"));
     }
+    async fn test_query(&self, _q: &str, _buf: &mut [u8]) -> crate::Result<usize> {
+        return Err(Error::not_implemented("test_query is not implemented for this client"));
+    }
+    async fn test_query_stream(&self, _q: &str) -> crate::Result<BoxStream<'static, crate::Result<Vec<u8>>>> {
+        return Err(Error::not_implemented("test_query_stream is not implemented for this client"));
+    }
 }
 
 impl Extension for () {
@@ -562,9 +571,10 @@ macro_rules! with_retries {
 #[macro_export]
 macro_rules! with_cancellation {
     ($op:expr, $response:expr) => {
-        with_cancellation!($op, $response, true)
+        crate::with_cancellation!($op, $response, true)
     };
     ($op:expr, $response:expr, $emit_warn: expr) => {
+        use crate::NotifyGuard;
         $response.ensure_active();
         tokio::select! {
             _ = $response.cancelled() => {
@@ -663,29 +673,30 @@ macro_rules! export_runtime_op {
             $($v: $t),+,
             response: *mut $response,
             handle: *const c_void
-        ) -> CResult {
-            let response = unsafe { ResponseGuard::new(response, handle) };
+        ) -> crate::CResult {
+            use crate::NotifyGuard;
+            let response = unsafe { crate::ResponseGuard::new(response, handle) };
             let state_result: Result<_, anyhow::Error> = $builder();
             let $state = match state_result {
                 Ok(s) => s,
                 Err(e) => {
                     response.into_error(e);
-                    return CResult::Error;
+                    return crate::CResult::Error;
                 }
             };
 
-            match RT.get() {
+            match crate::RT.get() {
                 Some(runtime) => {
                     runtime.spawn(async move {
                         let op = $asyncop;
 
-                        with_cancellation!(op, response);
+                        crate::with_cancellation!(op, response);
                     });
-                    CResult::Ok
+                    crate::CResult::Ok
                 }
                 None => {
                     response.into_error("object_store_ffi runtime not started (may be missing initialization)");
-                    return CResult::Error;
+                    return crate::CResult::Error;
                 }
             }
         }

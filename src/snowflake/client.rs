@@ -9,6 +9,11 @@ use crate::{duration_on_drop, error::{Error, RetryState}, metrics};
 use crate::util::{deserialize_str, deserialize_slice};
 use super::resolver::HickoryResolverWithEdns;
 
+use base64::{prelude::BASE64_STANDARD, Engine};
+use crate::error::ErrorExt;
+use anyhow::Context as AnyhowContext;
+use futures_util::{stream::{BoxStream, StreamExt}, TryFutureExt};
+use reqwest::header::{HeaderMap, HeaderValue};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -70,6 +75,19 @@ pub(crate) struct SnowflakeQueryData {
     chunk_headers: HashMap<String, String>,
     #[serde(default)]
     chunks: Vec<SnowflakeResultChunk>
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SnowflakeQueryArrowData {
+    pub(crate) rowtype: Vec<SnowflakeColType>,
+    pub(crate) rowset_base64: String,
+    pub(crate) total: usize,
+    pub(crate) returned: usize,
+    #[serde(default)]
+    pub(crate) chunk_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) chunks: Vec<SnowflakeResultChunk>
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -485,13 +503,27 @@ impl SnowflakeClient {
                 let response = self.client.post(format!("{}/session/v1/login-request", config.endpoint))
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/snowflake")
+                    .header("CLIENT_APP_ID", "Go")
                     .query(&qs)
                     .json(&serde_json::json!({
                         "data": {
+                            "CLIENT_APP_ID": "Go",
+                            "CLIENT_APP_VERSION": "1.6.22",
                             "PASSWORD": password,
                             "LOGIN_NAME": username,
                             "ACCOUNT_NAME": &config.account,
-                            "AUTHENTICATOR": "USERNAME_PASSWORD_MFA"
+                            "AUTHENTICATOR": "USERNAME_PASSWORD_MFA",
+                            "CLIENT_ENVIRONMENT": {
+                                "GO_VERSION": "go1.25",
+                                "OS": "darwin",
+                                "OS_VERSION": "gc-arm64",
+                                "OCSP_MODE": "FAIL_OPEN"
+                            },
+                            "SESSION_PARAMETERS": {
+                                "CLIENT_VALIDATE_DEFAULT_PARAMETERS": true,
+                                "GO_QUERY_RESULT_FORMAT": "ARROW",
+                                "CLIENT_RESULT_CHUNK_SIZE": 16
+                            }
                         }
                     }))
                     .send()
@@ -517,12 +549,26 @@ impl SnowflakeClient {
                 let response = self.client.post(format!("{}/session/v1/login-request", config.endpoint))
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/snowflake")
+                    .header("CLIENT_APP_ID", "Go")
                     .query(&qs)
                     .json(&serde_json::json!({
                         "data": {
                             "ACCOUNT_NAME": &config.account,
                             "TOKEN": &master_token,
-                            "AUTHENTICATOR": "OAUTH"
+                            "AUTHENTICATOR": "OAUTH",
+                            "CLIENT_APP_ID": "Go",
+                            "CLIENT_APP_VERSION": "1.6.22",
+                            "CLIENT_ENVIRONMENT": {
+                                "GO_VERSION": "go1.25",
+                                "OS": "darwin",
+                                "OS_VERSION": "gc-arm64",
+                                "OCSP_MODE": "FAIL_OPEN"
+                            },
+                            "SESSION_PARAMETERS": {
+                                "CLIENT_VALIDATE_DEFAULT_PARAMETERS": true,
+                                "GO_QUERY_RESULT_FORMAT": "ARROW",
+                                "CLIENT_RESULT_CHUNK_SIZE": 16
+                            }
                         }
                     }))
                     .send()
@@ -536,6 +582,8 @@ impl SnowflakeClient {
             let login_response_bytes = response
                 .bytes()
                 .await?;
+
+            println!("{:?}", String::from_utf8_lossy(&login_response_bytes));
 
             let login_response: SnowflakeResponse<SnowflakeLoginData> = deserialize_slice(&login_response_bytes)
                 .map_err(Error::deserialize_response_err("login"))?;
@@ -575,7 +623,7 @@ impl SnowflakeClient {
                 "sqlText": query.as_ref(),
                 "asyncExec": false,
                 "sequenceId": 1,
-                "isInternal": false
+                "isInternal": false,
             }))
             .send()
             .await?;
@@ -585,6 +633,8 @@ impl SnowflakeClient {
         let response_string = response
             .text()
             .await?;
+
+        println!("{response_string}");
 
         let response: SnowflakeResponse<T> = deserialize_str(&response_string)
             .map_err(Error::deserialize_response_err("query"))?;
@@ -598,10 +648,200 @@ impl SnowflakeClient {
             }
         }
     }
-    async fn query<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> crate::Result<T> {
+    pub(crate) async fn query<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> crate::Result<T> {
         let mut retry_state = RetryState::new(self.config.retry_config.clone());
         'retry: loop {
             match self.query_impl(query.as_ref()).await {
+                Err(e) => {
+                    match retry_state.should_retry(e) {
+                        Ok((e, info, duration)) => {
+                            counter!(metrics::total_sf_retries).increment(info.retries.unwrap_or(1) as u64);
+                            tracing::info!("retrying snowflake query error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
+                            tokio::time::sleep(duration).await;
+                            continue 'retry;
+                        }
+                        Err(e) => {
+                            break Err(e);
+                        }
+                    }
+                }
+                ok => {
+                    break ok;
+                }
+            }
+        }
+    }
+    async fn query_arrow_impl<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> crate::Result<T> {
+        let token = self.token().await?;
+        let _guard = duration_on_drop!(metrics::sf_query_attempt_duration);
+        let config = &self.config;
+        let response = self.client.post(format!("{}/queries/v1/query-request", config.endpoint))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/snowflake")
+            .header("Authorization", format!("Snowflake Token=\"{}\"", token))
+            .query(&[
+                ("clientStartTime", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string()),
+                ("requestId", uuid::Uuid::new_v4().to_string()),
+                ("request_guid", uuid::Uuid::new_v4().to_string())
+            ])
+            .json(&serde_json::json!({
+                "sqlText": query.as_ref(),
+                "asyncExec": false,
+                "sequenceId": 1,
+                "isInternal": false,
+                "parameters": {
+                    "GO_QUERY_RESULT_FORMAT": "ARROW"
+                }
+            }))
+            .send()
+            .await?;
+
+        response.error_for_status_ref()?;
+
+        let response_string = response
+            .text()
+            .await?;
+
+        // println!("{response_string}");
+
+        let response: SnowflakeResponse<T> = deserialize_str(&response_string)
+            .map_err(Error::deserialize_response_err("query"))?;
+
+        match response {
+            SnowflakeResponse::Success { data, .. } => {
+                Ok(data)
+            }
+            SnowflakeResponse::Error { data, code, message, .. } => {
+                Err(Error::error_response(format!("Error (code: {}, query_id: {}): {}", code, data.query_id, message)))
+            }
+        }
+    }
+    pub(crate) async fn query_arrow<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> crate::Result<T> {
+        let mut retry_state = RetryState::new(self.config.retry_config.clone());
+        'retry: loop {
+            match self.query_arrow_impl(query.as_ref()).await {
+                Err(e) => {
+                    match retry_state.should_retry(e) {
+                        Ok((e, info, duration)) => {
+                            counter!(metrics::total_sf_retries).increment(info.retries.unwrap_or(1) as u64);
+                            tracing::info!("retrying snowflake query error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
+                            tokio::time::sleep(duration).await;
+                            continue 'retry;
+                        }
+                        Err(e) => {
+                            break Err(e);
+                        }
+                    }
+                }
+                ok => {
+                    break ok;
+                }
+            }
+        }
+    }
+    async fn query_arrow_stream_impl(&self, query: impl AsRef<str>) -> crate::Result<BoxStream<'static, crate::Result<Vec<u8>>>> {
+        let token = self.token().await?;
+        let _guard = duration_on_drop!(metrics::sf_query_attempt_duration);
+        let config = &self.config;
+        let response = self.client.post(format!("{}/queries/v1/query-request", config.endpoint))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/snowflake")
+            .header("Authorization", format!("Snowflake Token=\"{}\"", token))
+            .query(&[
+                ("clientStartTime", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string()),
+                ("requestId", uuid::Uuid::new_v4().to_string()),
+                ("request_guid", uuid::Uuid::new_v4().to_string())
+            ])
+            .json(&serde_json::json!({
+                "sqlText": query.as_ref(),
+                "asyncExec": false,
+                "sequenceId": 1,
+                "isInternal": false,
+                "parameters": {
+                    "GO_QUERY_RESULT_FORMAT": "ARROW"
+                }
+            }))
+            .send()
+            .await?;
+
+        response.error_for_status_ref()?;
+
+        let response_string = response
+            .text()
+            .await?;
+
+        // println!("{response_string}");
+
+        let response: SnowflakeResponse<SnowflakeQueryArrowData> = deserialize_str(&response_string)
+            .map_err(Error::deserialize_response_err("query"))?;
+
+        match response {
+            SnowflakeResponse::Success { data, .. } => {
+                let inline_chunk = BASE64_STANDARD.decode(&data.rowset_base64)
+                    .context("failed to decode base64").to_err()?;
+                let header_map = HeaderMap::<HeaderValue>::try_from(&data.chunk_headers)
+                    .context("failed to parse chunk headers").to_err()?;
+                println!("CHUNKS: {}", data.chunks.len());
+                let state = (
+                    self.client.clone(),
+                    header_map.clone(),
+                    self.config.retry_config.clone()
+                );
+                let stream = futures_util::stream::iter(data.chunks)
+                    .scan(state, |state, chunk| {
+                        let state = state.clone();
+                        async move { Some((state, chunk)) }
+                    })
+                    .map(|((client, headers, retry_config), chunk)| async move {
+                        return tokio::spawn(async move {
+                            let mut retry_state = RetryState::new(retry_config);
+                            'retry: loop {
+                                match client.get(&chunk.url)
+                                    .headers(headers.clone())
+                                    .send()
+                                    .and_then(|response| async move {
+                                        return response.bytes().await
+                                    }).await
+                                {
+                                    Ok(bytes) => {
+                                        return Ok::<_, crate::Error>(
+                                            Vec::<u8>::from(bytes.try_into_mut().expect("unique"))
+                                        )
+                                    }
+                                    Err(e) => {
+                                        match retry_state.should_retry(e.into()) {
+                                            Ok((e, info, duration)) => {
+                                                tracing::info!("retrying chunk fetch error (reason: {:?}) after {:?}: {}", info.reason, duration, e);
+                                                tokio::time::sleep(duration).await;
+                                                continue 'retry;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("[chunk fetch] {}", e);
+                                                return Err(e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }).await?;
+                    })
+                    .buffered(64);
+
+                let chained = futures_util::stream::once(async { Ok(inline_chunk) })
+                    .chain(stream)
+                    .boxed();
+
+                Ok(chained)
+            }
+            SnowflakeResponse::Error { data, code, message, .. } => {
+                Err(Error::error_response(format!("Error (code: {}, query_id: {}): {}", code, data.query_id, message)))
+            }
+        }
+    }
+    pub(crate) async fn query_arrow_stream(&self, query: impl AsRef<str>) -> crate::Result<BoxStream<'static, crate::Result<Vec<u8>>>> {
+        let mut retry_state = RetryState::new(self.config.retry_config.clone());
+        'retry: loop {
+            match self.query_arrow_stream_impl(query.as_ref()).await {
                 Err(e) => {
                     match retry_state.should_retry(e) {
                         Ok((e, info, duration)) => {

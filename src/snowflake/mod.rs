@@ -2,10 +2,12 @@ use crate::{clients, encryption::{CryptoMaterialProvider, CryptoScheme}, error::
 use crate::{RT, with_cancellation};
 
 pub(crate) mod client;
-use anyhow::Context as AnyhowContext;
-use client::{NormalizedStageInfo, SnowflakeClient, SnowflakeClientConfig};
+use anyhow::{anyhow, Context as AnyhowContext};
+use base64::{prelude::BASE64_STANDARD, Engine};
+use client::{NormalizedStageInfo, SnowflakeClient, SnowflakeClientConfig, SnowflakeQueryArrowData, SnowflakeQueryData};
 
 pub(crate) mod kms;
+use futures_util::stream::BoxStream;
 use kms::{SnowflakeStageS3Kms, SnowflakeStageAzureKms, SnowflakeStageKmsConfig};
 
 mod resolver;
@@ -39,6 +41,22 @@ impl Extension for SnowflakeS3Extension {
         let string = serde_json::to_string(&stage_info)
             .context("failed to encode stage_info as json").to_err()?;
         Ok(string)
+    }
+    async fn test_query(&self, q: &str, buf: &mut [u8]) -> crate::Result<usize> {
+        let result: SnowflakeQueryArrowData = self
+            .client
+            .query_arrow(q)
+            .await?;
+        let n = BASE64_STANDARD.decode_slice(&result.rowset_base64, buf)
+            .context("failed to decode base64").to_err()?;
+        Ok(n)
+    }
+    async fn test_query_stream(&self, q: &str) -> crate::Result<BoxStream<'static, crate::Result<Vec<u8>>>> {
+        let stream = self
+            .client
+            .query_arrow_stream(q)
+            .await?;
+        Ok(stream)
     }
 }
 
