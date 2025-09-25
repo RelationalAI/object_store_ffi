@@ -63,7 +63,7 @@ static STATIC_CONFIG: OnceCell<StaticConfig> = OnceCell::new();
 pub type ResultCallback = unsafe extern "C" fn(task: *const c_void) -> i32;
 pub static RESULT_CB: OnceCell<ResultCallback> = OnceCell::new();
 
-type PanicCallback = unsafe extern "C" fn() -> i32;
+pub type PanicCallback = unsafe extern "C" fn() -> i32;
 
 fn runtime() -> &'static Runtime {
     RT.get().expect("start was not called")
