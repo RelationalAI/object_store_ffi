@@ -76,7 +76,7 @@ chrono = "0.4.40"
 clap = { version = "4.4", features = ["derive", "env"], optional = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-openssl = { version = "0.10.66" }
+openssl = { version = "0.10.72" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 openssl = { version = "0.10.66", features = ["vendored"] }
