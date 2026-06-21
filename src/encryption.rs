@@ -142,11 +142,15 @@ impl Key {
     pub(crate) fn len(&self) -> usize {
         self.bytes.len()
     }
-    pub(crate) fn encrypt_aes_128_ecb(self, encryption_key: &Key) -> std::io::Result<EncryptedKey> {
-        let cipher = Cipher::aes_128_ecb();
-        if encryption_key.len() != cipher.key_len() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid key size"));
-        }
+    pub(crate) fn encrypt_aes_ecb(self, encryption_key: &Key) -> std::io::Result<EncryptedKey> {
+        let cipher = match encryption_key.len() {
+            16 => Cipher::aes_128_ecb(),
+            32 => Cipher::aes_256_ecb(),
+            n => return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid key size: {n} bytes (expected 16 or 32)"),
+            )),
+        };
 
         let encrypted_bytes = symm::encrypt(cipher, &encryption_key, None, &self)?;
 
@@ -164,7 +168,6 @@ impl Drop for Key {
     }
 }
 
-// Always encrypted with aes_128_ecb for now
 #[derive(Clone)]
 pub(crate) struct EncryptedKey {
     bytes: Vec<u8>,
@@ -174,11 +177,15 @@ impl EncryptedKey {
     pub(crate) fn from_base64(key: impl AsRef<str>) -> Result<EncryptedKey, base64::DecodeError> {
         Ok(EncryptedKey { bytes: BASE64_STANDARD.decode(key.as_ref())? })
     }
-    pub(crate) fn decrypt_aes_128_ecb(self, decryption_key: &Key) -> std::io::Result<Key> {
-        let cipher = Cipher::aes_128_ecb();
-        if decryption_key.len() != cipher.key_len() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid key size"));
-        }
+    pub(crate) fn decrypt_aes_ecb(self, decryption_key: &Key) -> std::io::Result<Key> {
+        let cipher = match decryption_key.len() {
+            16 => Cipher::aes_128_ecb(),
+            32 => Cipher::aes_256_ecb(),
+            n => return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid key size: {n} bytes (expected 16 or 32)"),
+            )),
+        };
         let bytes = symm::decrypt(cipher, &decryption_key, None, &self.bytes)?;
 
         Ok(Key { bytes })
