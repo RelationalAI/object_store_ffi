@@ -198,7 +198,7 @@ impl Client {
                 }
             })
             .buffer_unordered(32)
-            .try_collect().await?;
+            .try_collect::<()>().await?;
 
         Ok(count)
     }

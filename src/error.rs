@@ -77,7 +77,7 @@ impl fmt::Display for Error {
                 .map(|(idx, cause)| {
                     write!(formatter, "    {}: {}\n", idx, cause)
                 })
-                .collect::<Result<_, fmt::Error>>()?;
+                .collect::<Result<(), fmt::Error>>()?;
         }
         if let Some(metadata) = self.metadata.as_ref() {
             let report = metadata.retry_report();
