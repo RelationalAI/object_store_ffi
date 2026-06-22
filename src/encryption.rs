@@ -1352,4 +1352,54 @@ mod tests {
             assert!(compare_large_slices(&data, &plaintext));
         }
     }
+
+    // Key-wrap primitives: `encrypt_aes_ecb` / `decrypt_aes_ecb` wrap a file's
+    // content-encryption key (CEK) with a per-stage master key using AES-ECB,
+    // selecting the cipher from the master key length (16 -> AES-128, 32 -> AES-256).
+    // Snowflake client-side encryption depends on this
+    fn assert_key_wrap_round_trip(master_len: usize, cek_len: usize) {
+        let master = Key::generate(master_len);
+        let cek = Key::generate(cek_len);
+        let cek_bytes = cek.bytes.clone();
+
+        let wrapped = cek.encrypt_aes_ecb(&master).unwrap();
+        let unwrapped = wrapped.decrypt_aes_ecb(&master).unwrap();
+
+        assert_eq!(cek_bytes, unwrapped.bytes);
+    }
+
+    #[test]
+    fn key_wrap_round_trip_aes_128() {
+        // 16-byte master key selects AES-128-ECB
+        assert_key_wrap_round_trip(16, 16);
+        assert_key_wrap_round_trip(16, 32);
+    }
+
+    #[test]
+    fn key_wrap_round_trip_aes_256() {
+        // 32-byte master key selects AES-256-ECB
+        assert_key_wrap_round_trip(32, 16);
+        assert_key_wrap_round_trip(32, 32);
+    }
+
+    #[test]
+    fn key_wrap_rejects_unsupported_master_key_size() {
+        // Only 16- and 32-byte master keys are supported. Anything else fails loudly
+        let cek = Key::generate(16);
+        let good_master = Key::generate(16);
+        for bad_len in [0usize, 15, 24, 33, 64] {
+            let bad_master = Key::generate(bad_len);
+            assert!(
+                cek.clone().encrypt_aes_ecb(&bad_master).is_err(),
+                "wrap with {bad_len}-byte master key should be rejected"
+            );
+
+            let wrapped = cek.clone().encrypt_aes_ecb(&good_master).unwrap();
+            let bad_master = Key::generate(bad_len);
+            assert!(
+                wrapped.decrypt_aes_ecb(&bad_master).is_err(),
+                "unwrap with {bad_len}-byte master key should be rejected"
+            );
+        }
+    }
 }
