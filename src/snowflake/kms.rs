@@ -84,17 +84,17 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
 
         let encryption_material = info.encryption_material.as_ref()
             .ok_or_else(|| ErrorKind::StorageNotEncrypted(self.stage.clone()))?;
-        let description = MaterialDescription {
-            smk_id: encryption_material.smk_id.to_string(),
-            query_id: encryption_material.query_id.clone(),
-            key_size: "128".to_string()
-        };
         let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
             .map_err(ErrorKind::MaterialDecode)?;
 
         let scheme = self.config.crypto_scheme;
+        let description = MaterialDescription {
+            smk_id: encryption_material.smk_id.to_string(),
+            query_id: encryption_material.query_id.clone(),
+            key_size: (master_key.len() * 8).to_string()
+        };
         let mut material = ContentCryptoMaterial::generate(scheme);
-        let encrypted_cek = material.cek.clone().encrypt_aes_128_ecb(&master_key)
+        let encrypted_cek = material.cek.clone().encrypt_aes_ecb(&master_key)
             .map_err(ErrorKind::MaterialCrypt)?;
 
         let mut attributes = Attributes::new();
@@ -152,7 +152,7 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
 
         let cek = EncryptedKey::from_base64(required_attribute(&attr, "x-amz-key")?)
             .map_err(ErrorKind::MaterialDecode)?;
-        let cek = cek.decrypt_aes_128_ecb(&master_key)
+        let cek = cek.decrypt_aes_ecb(&master_key)
             .map_err(ErrorKind::MaterialCrypt)?;
         let iv = Iv::from_base64(required_attribute(&attr, "x-amz-iv")?)
             .map_err(ErrorKind::MaterialDecode)?;
@@ -232,17 +232,17 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         let encryption_material = info.encryption_material.as_ref()
             .ok_or_else(|| ErrorKind::StorageNotEncrypted(self.stage.clone()))?;
 
-        let description = MaterialDescription {
-            smk_id: encryption_material.smk_id.to_string(),
-            query_id: encryption_material.query_id.clone(),
-            key_size: "128".to_string()
-        };
         let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
             .map_err(ErrorKind::MaterialDecode)?;
 
         let scheme = self.config.crypto_scheme;
+        let description = MaterialDescription {
+            smk_id: encryption_material.smk_id.to_string(),
+            query_id: encryption_material.query_id.clone(),
+            key_size: (master_key.len() * 8).to_string()
+        };
         let material = ContentCryptoMaterial::generate(scheme);
-        let encrypted_cek = material.cek.clone().encrypt_aes_128_ecb(&master_key)
+        let encrypted_cek = material.cek.clone().encrypt_aes_ecb(&master_key)
             .map_err(ErrorKind::MaterialCrypt)?;
 
         let mut attributes = Attributes::new();
@@ -309,7 +309,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
 
         let cek = EncryptedKey::from_base64(&encryption_data.wrapped_content_key.encrypted_key)
             .map_err(ErrorKind::MaterialDecode)?;
-        let cek = cek.decrypt_aes_128_ecb(&master_key)
+        let cek = cek.decrypt_aes_ecb(&master_key)
             .map_err(ErrorKind::MaterialCrypt)?;
         let iv = Iv::from_base64(&encryption_data.content_encryption_i_v)
             .map_err(ErrorKind::MaterialDecode)?;
