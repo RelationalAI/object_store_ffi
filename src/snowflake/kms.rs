@@ -139,7 +139,7 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
         let _guard = duration_on_drop!(metrics::material_from_metadata_duration);
         let path = path.strip_prefix(&self.prefix).unwrap_or(path);
 
-        let material_description: MaterialDescription = 
+        let material_description: MaterialDescription =
             deserialize_str(required_attribute(&attr, "x-amz-matdesc")?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
@@ -150,6 +150,13 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
             &self.stage,
             &self.keyring,
         ).await?;
+
+        tracing::warn!(
+            matdesc_key_size = ?material_description.key_size,
+            master_key_len = master_key.len(),
+            master_key_bits = master_key.len() * 8,
+            "S3 matdesc key_size from Snowflake"
+        );
 
         let cek = EncryptedKey::from_base64(required_attribute(&attr, "x-amz-key")?)
             .map_err(ErrorKind::MaterialDecode)?;
@@ -292,7 +299,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         let _guard = duration_on_drop!(metrics::material_from_metadata_duration);
         let path = path.strip_prefix(&self.prefix).unwrap_or(path);
 
-        let material_description: MaterialDescription = 
+        let material_description: MaterialDescription =
             deserialize_str(required_attribute(&attr, AZURE_MATDESC_KEY)?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
@@ -303,6 +310,13 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             &self.stage,
             &self.keyring,
         ).await?;
+
+        tracing::warn!(
+            matdesc_key_size = ?material_description.key_size,
+            master_key_len = master_key.len(),
+            master_key_bits = master_key.len() * 8,
+            "Azure matdesc key_size from Snowflake"
+        );
 
         let encryption_data: EncryptionData = 
             deserialize_str(required_attribute(&attr, AZURE_ENCDATA_KEY)?)
