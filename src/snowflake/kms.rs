@@ -13,7 +13,8 @@ use std::sync::Arc;
 pub(crate) struct MaterialDescription {
     pub smk_id: String,
     pub query_id: String,
-    pub key_size: String
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_size: Option<String>
 }
 
 #[derive(Clone, Debug)]
@@ -91,7 +92,7 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
         let description = MaterialDescription {
             smk_id: encryption_material.smk_id.to_string(),
             query_id: encryption_material.query_id.clone(),
-            key_size: (master_key.len() * 8).to_string()
+            key_size: Some((master_key.len() * 8).to_string())
         };
         let mut material = ContentCryptoMaterial::generate(scheme);
         let encrypted_cek = material.cek.clone().encrypt_aes_ecb(&master_key)
@@ -138,7 +139,7 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
         let _guard = duration_on_drop!(metrics::material_from_metadata_duration);
         let path = path.strip_prefix(&self.prefix).unwrap_or(path);
 
-        let material_description: MaterialDescription = 
+        let material_description: MaterialDescription =
             deserialize_str(required_attribute(&attr, "x-amz-matdesc")?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
@@ -239,7 +240,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         let description = MaterialDescription {
             smk_id: encryption_material.smk_id.to_string(),
             query_id: encryption_material.query_id.clone(),
-            key_size: (master_key.len() * 8).to_string()
+            key_size: Some((master_key.len() * 8).to_string())
         };
         let material = ContentCryptoMaterial::generate(scheme);
         let encrypted_cek = material.cek.clone().encrypt_aes_ecb(&master_key)
@@ -291,7 +292,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         let _guard = duration_on_drop!(metrics::material_from_metadata_duration);
         let path = path.strip_prefix(&self.prefix).unwrap_or(path);
 
-        let material_description: MaterialDescription = 
+        let material_description: MaterialDescription =
             deserialize_str(required_attribute(&attr, AZURE_MATDESC_KEY)?)
             .map_err(Error::deserialize_response_err("failed to deserialize matdesc"))?;
 
@@ -386,4 +387,54 @@ async fn get_master_key(
     }).await?;
     counter!(metrics::total_keyring_get).increment(1);
     Ok(master_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MaterialDescription;
+
+    #[test]
+    fn material_description_keysize_present() {
+        let json = r#"{"smkId":"1","queryId":"abc","keySize":"128"}"#;
+        let d: MaterialDescription = serde_json::from_str(json).unwrap();
+        assert_eq!(d.smk_id, "1");
+        assert_eq!(d.query_id, "abc");
+        assert_eq!(d.key_size, Some("128".to_string()));
+    }
+
+    #[test]
+    fn material_description_keysize_absent() {
+        // Snowflake omits keySize when CLIENT_ENCRYPTION_KEY_SIZE=256
+        let json = r#"{"smkId":"1","queryId":"abc"}"#;
+        let d: MaterialDescription = serde_json::from_str(json).unwrap();
+        assert_eq!(d.smk_id, "1");
+        assert_eq!(d.query_id, "abc");
+        assert_eq!(d.key_size, None);
+    }
+
+    #[test]
+    fn material_description_keysize_roundtrip() {
+        // When we write matdesc with keySize set, it serializes and deserializes correctly
+        let d = MaterialDescription {
+            smk_id: "1".to_string(),
+            query_id: "abc".to_string(),
+            key_size: Some("256".to_string()),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("keySize"));
+        let d2: MaterialDescription = serde_json::from_str(&json).unwrap();
+        assert_eq!(d2.key_size, Some("256".to_string()));
+    }
+
+    #[test]
+    fn material_description_keysize_none_not_serialized() {
+        // When key_size is None, keySize is omitted from the serialized JSON
+        let d = MaterialDescription {
+            smk_id: "1".to_string(),
+            query_id: "abc".to_string(),
+            key_size: None,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("keySize"));
+    }
 }
