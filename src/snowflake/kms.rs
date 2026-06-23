@@ -13,7 +13,8 @@ use std::sync::Arc;
 pub(crate) struct MaterialDescription {
     pub smk_id: String,
     pub query_id: String,
-    pub key_size: String
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_size: Option<String>
 }
 
 #[derive(Clone, Debug)]
@@ -91,7 +92,7 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
         let description = MaterialDescription {
             smk_id: encryption_material.smk_id.to_string(),
             query_id: encryption_material.query_id.clone(),
-            key_size: (master_key.len() * 8).to_string()
+            key_size: Some((master_key.len() * 8).to_string())
         };
         let mut material = ContentCryptoMaterial::generate(scheme);
         let encrypted_cek = material.cek.clone().encrypt_aes_ecb(&master_key)
@@ -239,7 +240,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         let description = MaterialDescription {
             smk_id: encryption_material.smk_id.to_string(),
             query_id: encryption_material.query_id.clone(),
-            key_size: (master_key.len() * 8).to_string()
+            key_size: Some((master_key.len() * 8).to_string())
         };
         let material = ContentCryptoMaterial::generate(scheme);
         let encrypted_cek = material.cek.clone().encrypt_aes_ecb(&master_key)
