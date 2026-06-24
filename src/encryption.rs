@@ -28,7 +28,7 @@ pub(crate) trait CryptoMaterialProvider:
     async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> crate::Result<ContentCryptoMaterial>;
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum CryptoScheme {
     Aes256Gcm,
     Aes128Cbc,
@@ -1057,6 +1057,66 @@ mod tests {
 
         let plaintext = decrypt(&ciphertext, &material).unwrap();
 
+        assert_eq!(data, plaintext);
+    }
+
+    #[test]
+    fn aes_256_cbc_uses_a_32_byte_key() {
+        // The whole point of the Aes256Cbc variant: it generates and expects a
+        // 32-byte content-encryption key, where Aes128Cbc uses 16.
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes256Cbc);
+        assert_eq!(material.scheme.key_len(), 32);
+        assert_eq!(material.cek.len(), 32);
+
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes128Cbc);
+        assert_eq!(material.scheme.key_len(), 16);
+        assert_eq!(material.cek.len(), 16);
+    }
+
+    #[test]
+    fn content_encryption_aes_256_cbc_round_trip() {
+        let data: Vec<u8> = (0..100000u32).map(|n| (n % 256) as u8).collect();
+
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes256Cbc);
+
+        let ciphertext = encrypt(&data, &material).unwrap();
+
+        let plaintext = decrypt(&ciphertext, &material).unwrap();
+
+        assert_eq!(data, plaintext);
+    }
+
+    #[tokio::test]
+    async fn crypter_reader_aes_256_cbc_round_trip() {
+        let data: Vec<u8> = (0..100000u32).map(|n| (n % 256) as u8).collect();
+
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes256Cbc);
+
+        let mut reader = CrypterReader::new(data.as_slice(), Mode::Encrypt, &material).unwrap();
+        let mut ciphertext = vec![];
+        reader.read_to_end(&mut ciphertext).await.unwrap();
+
+        let mut reader = CrypterReader::new(ciphertext.as_slice(), Mode::Decrypt, &material).unwrap();
+        let mut plaintext = vec![];
+        reader.read_to_end(&mut plaintext).await.unwrap();
+        assert_eq!(data, plaintext);
+    }
+
+    #[tokio::test]
+    async fn crypter_writer_and_reader_aes_256_cbc_round_trip() {
+        let data: Vec<u8> = (0..100000u32).map(|n| (n % 256) as u8).collect();
+
+        let material = ContentCryptoMaterial::generate(CryptoScheme::Aes256Cbc);
+
+        let mut ciphertext = vec![];
+        let mut writer = CrypterWriter::new(&mut ciphertext, Mode::Encrypt, &material).unwrap();
+        writer.write_all(&data).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut reader = CrypterReader::new(ciphertext.as_slice(), Mode::Decrypt, &material).unwrap();
+        let mut plaintext = vec![];
+        reader.read_to_end(&mut plaintext).await.unwrap();
         assert_eq!(data, plaintext);
     }
 

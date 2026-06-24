@@ -157,19 +157,13 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
             .map_err(ErrorKind::MaterialCrypt)?;
         let iv = Iv::from_base64(required_attribute(&attr, "x-amz-iv")?)
             .map_err(ErrorKind::MaterialDecode)?;
-        let alg = required_attribute(&attr, "x-amz-cek-alg");
+        // The attribute may be absent for older writes; treat that as CBC.
+        let cek_alg = required_attribute(&attr, "x-amz-cek-alg").ok();
 
-        let scheme = match alg {
-            Ok("AES/GCM/NoPadding") => CryptoScheme::Aes256Gcm,
-            Ok("AES/CBC/PKCS5Padding") | Err(_) => match cek.len() {
-                32 => CryptoScheme::Aes256Cbc,
-                _  => CryptoScheme::Aes128Cbc,
-            },
-            Ok(v) => return Err(Error::not_implemented(format!("cek alg `{}` not implemented", v)))
-        };
+        let scheme = s3_content_scheme(cek_alg, cek.len())?;
 
-        let aad = match alg {
-            Ok("AES/GCM/NoPadding") => Some("AES/GCM/NoPadding".into()),
+        let aad = match cek_alg {
+            Some("AES/GCM/NoPadding") => Some("AES/GCM/NoPadding".into()),
             _ => None
         };
 
@@ -322,11 +316,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         let iv = Iv::from_base64(&encryption_data.content_encryption_i_v)
             .map_err(ErrorKind::MaterialDecode)?;
 
-        let scheme = match encryption_data.encryption_agent.encryption_algorithm.as_str() {
-            "AES_CBC_128" => CryptoScheme::Aes128Cbc,
-            "AES_CBC_256" => CryptoScheme::Aes256Cbc,
-            v => return Err(Error::not_implemented(format!("encryption algorithm `{}` not implemented", v)))
-        };
+        let scheme = azure_content_scheme(&encryption_data.encryption_agent.encryption_algorithm)?;
 
         let content_material = ContentCryptoMaterial {
             scheme,
@@ -371,6 +361,36 @@ struct KeyWrappingMetadata {
     encryption_library: String,
 }
 
+/// Select the content cipher for an object read from an S3 stage.
+///
+/// Unlike Azure (see [`azure_content_scheme`]), the S3 `x-amz-cek-alg`
+/// attribute only encodes the *mode* (`AES/GCM/NoPadding` vs
+/// `AES/CBC/PKCS5Padding`), not the CBC key size. We therefore derive
+/// AES-128 vs AES-256 from the length of the unwrapped CEK (16 vs 32 bytes).
+/// A missing attribute is treated as CBC for backwards compatibility.
+fn s3_content_scheme(cek_alg: Option<&str>, cek_len: usize) -> crate::Result<CryptoScheme> {
+    match cek_alg {
+        Some("AES/GCM/NoPadding") => Ok(CryptoScheme::Aes256Gcm),
+        Some("AES/CBC/PKCS5Padding") | None => Ok(match cek_len {
+            32 => CryptoScheme::Aes256Cbc,
+            _  => CryptoScheme::Aes128Cbc,
+        }),
+        Some(v) => Err(Error::not_implemented(format!("cek alg `{}` not implemented", v)))
+    }
+}
+
+/// Select the content cipher for an object read from an Azure stage.
+///
+/// The Azure `encryptiondata` envelope spells out the key size in the
+/// algorithm name, so no CEK-length inference is needed.
+fn azure_content_scheme(encryption_algorithm: &str) -> crate::Result<CryptoScheme> {
+    match encryption_algorithm {
+        "AES_CBC_128" => Ok(CryptoScheme::Aes128Cbc),
+        "AES_CBC_256" => Ok(CryptoScheme::Aes256Cbc),
+        v => Err(Error::not_implemented(format!("encryption algorithm `{}` not implemented", v)))
+    }
+}
+
 async fn get_master_key(
     client: &SnowflakeClient,
     query_id: String,
@@ -398,7 +418,46 @@ async fn get_master_key(
 
 #[cfg(test)]
 mod tests {
-    use super::MaterialDescription;
+    use super::{MaterialDescription, s3_content_scheme, azure_content_scheme};
+    use crate::encryption::CryptoScheme;
+
+    #[test]
+    fn s3_scheme_gcm_is_always_256() {
+        // GCM is identified directly by the cek-alg, regardless of cek length.
+        assert_eq!(s3_content_scheme(Some("AES/GCM/NoPadding"), 32).unwrap(), CryptoScheme::Aes256Gcm);
+    }
+
+    #[test]
+    fn s3_scheme_cbc_is_selected_by_cek_length() {
+        // A 32-byte CEK means AES-256-CBC; anything else falls back to AES-128-CBC.
+        // This is the core of the CLIENT_ENCRYPTION_KEY_SIZE=256 fix.
+        assert_eq!(s3_content_scheme(Some("AES/CBC/PKCS5Padding"), 32).unwrap(), CryptoScheme::Aes256Cbc);
+        assert_eq!(s3_content_scheme(Some("AES/CBC/PKCS5Padding"), 16).unwrap(), CryptoScheme::Aes128Cbc);
+    }
+
+    #[test]
+    fn s3_scheme_missing_alg_defaults_to_cbc_by_length() {
+        // Older writes may omit the cek-alg attribute entirely.
+        assert_eq!(s3_content_scheme(None, 32).unwrap(), CryptoScheme::Aes256Cbc);
+        assert_eq!(s3_content_scheme(None, 16).unwrap(), CryptoScheme::Aes128Cbc);
+    }
+
+    #[test]
+    fn s3_scheme_unknown_alg_is_rejected() {
+        // Unknown algorithms must return an error rather than panic across FFI.
+        assert!(s3_content_scheme(Some("AES/XTS/NoPadding"), 32).is_err());
+    }
+
+    #[test]
+    fn azure_scheme_maps_key_size_from_algorithm_name() {
+        assert_eq!(azure_content_scheme("AES_CBC_128").unwrap(), CryptoScheme::Aes128Cbc);
+        assert_eq!(azure_content_scheme("AES_CBC_256").unwrap(), CryptoScheme::Aes256Cbc);
+    }
+
+    #[test]
+    fn azure_scheme_unknown_alg_is_rejected() {
+        assert!(azure_content_scheme("AES_GCM_256").is_err());
+    }
 
     #[test]
     fn material_description_keysize_present() {
