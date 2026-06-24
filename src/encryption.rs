@@ -31,7 +31,8 @@ pub(crate) trait CryptoMaterialProvider:
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum CryptoScheme {
     Aes256Gcm,
-    Aes128Cbc
+    Aes128Cbc,
+    Aes256Cbc,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -59,13 +60,14 @@ impl CryptoScheme {
     pub(crate) fn tag_len(&self) -> usize {
         match self {
             CryptoScheme::Aes256Gcm => AES_GCM_TAG_BYTES,
-            CryptoScheme::Aes128Cbc => 0
+            CryptoScheme::Aes128Cbc | CryptoScheme::Aes256Cbc => 0
         }
     }
     pub(crate) fn cipher(&self) -> Cipher {
         match self {
             CryptoScheme::Aes256Gcm => Cipher::aes_256_gcm(),
             CryptoScheme::Aes128Cbc => Cipher::aes_128_cbc(),
+            CryptoScheme::Aes256Cbc => Cipher::aes_256_cbc(),
         }
     }
 }
@@ -225,7 +227,7 @@ pub(crate) fn encrypt(
     material: &ContentCryptoMaterial
 ) -> std::io::Result<Vec<u8>> {
     match material.scheme {
-        CryptoScheme::Aes128Cbc => {
+        CryptoScheme::Aes128Cbc | CryptoScheme::Aes256Cbc => {
             let ContentCryptoMaterial { scheme, cek, iv, .. } = material;
             Ok(symm::encrypt(scheme.cipher(), &cek, Some(&iv), data)?)
 
@@ -248,7 +250,7 @@ pub(crate) fn decrypt(
     material: &ContentCryptoMaterial
 ) -> std::io::Result<Vec<u8>> {
     match material.scheme {
-        CryptoScheme::Aes128Cbc => {
+        CryptoScheme::Aes128Cbc | CryptoScheme::Aes256Cbc => {
             let ContentCryptoMaterial { scheme, cek, iv, .. } = material;
             // Tolerate zero length without padding
             if ciphertext.len() == 0 {

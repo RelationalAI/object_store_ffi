@@ -124,7 +124,7 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
                 material = material.with_aad(cek_alg);
                 cek_alg
             },
-            CryptoScheme::Aes128Cbc => "AES/CBC/PKCS5Padding"
+            CryptoScheme::Aes128Cbc | CryptoScheme::Aes256Cbc => "AES/CBC/PKCS5Padding"
         };
 
         attributes.insert(
@@ -161,8 +161,11 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
 
         let scheme = match alg {
             Ok("AES/GCM/NoPadding") => CryptoScheme::Aes256Gcm,
-            Ok("AES/CBC/PKCS5Padding") | Err(_) => CryptoScheme::Aes128Cbc,
-            Ok(v) => unimplemented!("cek alg `{}` not implemented", v)
+            Ok("AES/CBC/PKCS5Padding") | Err(_) => match cek.len() {
+                32 => CryptoScheme::Aes256Cbc,
+                _  => CryptoScheme::Aes128Cbc,
+            },
+            Ok(v) => return Err(Error::not_implemented(format!("cek alg `{}` not implemented", v)))
         };
 
         let aad = match alg {
@@ -259,7 +262,11 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             },
             encryption_agent: EncryptionAgent {
                 protocol: "1.0".to_string(),
-                encryption_algorithm: "AES_CBC_128".to_string(),
+                encryption_algorithm: match scheme {
+                    CryptoScheme::Aes128Cbc => "AES_CBC_128".to_string(),
+                    CryptoScheme::Aes256Cbc => "AES_CBC_256".to_string(),
+                    CryptoScheme::Aes256Gcm => return Err(Error::not_implemented("GCM is not supported for Azure stage encryption")),
+                },
             },
             content_encryption_i_v: material.iv.as_base64(),
             key_wrapping_metadata: KeyWrappingMetadata {
@@ -317,8 +324,8 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
 
         let scheme = match encryption_data.encryption_agent.encryption_algorithm.as_str() {
             "AES_CBC_128" => CryptoScheme::Aes128Cbc,
-            "AES_CBC_256" => CryptoScheme::Aes128Cbc,
-            v => unimplemented!("encryption algorithm `{}` not implemented", v)
+            "AES_CBC_256" => CryptoScheme::Aes256Cbc,
+            v => return Err(Error::not_implemented(format!("encryption algorithm `{}` not implemented", v)))
         };
 
         let content_material = ContentCryptoMaterial {

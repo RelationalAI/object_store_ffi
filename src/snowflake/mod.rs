@@ -326,6 +326,7 @@ pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, r
            crypto_scheme: match scheme_str.as_str() {
                 "AES_256_GCM" => CryptoScheme::Aes256Gcm,
                 "AES_128_CBC" => CryptoScheme::Aes128Cbc,
+                "AES_256_CBC" => CryptoScheme::Aes256Cbc,
                 _ => return Err(Error::invalid_config("Invalid value for snowflake_encryption_scheme").into()),
            },
            keyring_capacity: match map.remove("snowflake_keyring_capacity").map(|s| s.parse::<usize>()) {
