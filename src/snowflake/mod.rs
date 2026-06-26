@@ -311,6 +311,8 @@ pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, r
         warehouse: map.remove("snowflake_warehouse").or(std::env::var("SNOWFLAKE_WAREHOUSE").ok()),
         username: map.remove("snowflake_username").or(std::env::var("SNOWFLAKE_USERNAME").ok()),
         password: map.remove("snowflake_password").or(std::env::var("SNOWFLAKE_PASSWORD").ok()),
+        pat_token: map.remove("snowflake_pat_token").or(std::env::var("SNOWFLAKE_PAT_TOKEN").ok()),
+        private_key_path: map.remove("snowflake_private_key_path").or(std::env::var("SNOWFLAKE_PRIVATE_KEY_PATH").ok()),
         role: map.remove("snowflake_role").or(std::env::var("SNOWFLAKE_ROLE").ok()),
         master_token_path: map.remove("snowflake_master_token_path").or(std::env::var("MASTER_TOKEN_PATH").ok()),
         stage_info_cache_ttl: map.remove("snowflake_stage_info_cache_ttl_secs")
