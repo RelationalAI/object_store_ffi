@@ -28,6 +28,13 @@ pub(crate) trait CryptoMaterialProvider:
     async fn material_from_metadata(&self, path: &str, attr: &Attributes) -> crate::Result<ContentCryptoMaterial>;
 }
 
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum CipherType {
+    AesGcm,
+    AesCbc,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum CryptoScheme {
     Aes256Gcm,
@@ -465,18 +472,22 @@ impl<R: AsyncRead> CrypterReader<R> {
         })
     }
 
+    #[allow(dead_code)]
     pub fn get_ref(&self) -> &R {
         &self.reader
     }
 
+    #[allow(dead_code)]
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.reader
     }
 
+    #[allow(dead_code)]
     pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut R> {
         self.project().reader
     }
 
+    #[allow(dead_code)]
     pub fn into_inner(self) -> R {
         self.reader
     }
@@ -737,18 +748,22 @@ impl<W: AsyncWrite> CrypterWriter<W> {
         })
     }
 
+    #[allow(dead_code)]
     pub fn get_ref(&self) -> &W {
         &self.writer
     }
 
+    #[allow(dead_code)]
     pub fn get_mut(&mut self) -> &mut W {
         &mut self.writer
     }
 
+    #[allow(dead_code)]
     pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut W> {
         self.project().writer
     }
 
+    #[allow(dead_code)]
     pub fn into_inner(self) -> W {
         self.writer
     }

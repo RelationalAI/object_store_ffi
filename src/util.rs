@@ -493,3 +493,9 @@ pub(crate) fn required_attribute<'a>(attr: &'a Attributes, key: &'static str) ->
         .as_ref();
     Ok::<_, Error>(v)
 }
+
+pub(crate) fn optional_attribute<'a>(attr: &'a Attributes, key: &'static str) -> Option<&'a str> {
+    let v: Option<&str> = attr.get(&Attribute::Metadata(key.into()))
+        .map(|v| v.as_ref());
+    v
+}

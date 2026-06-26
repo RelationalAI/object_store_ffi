@@ -1,5 +1,16 @@
 use ::metrics::counter;
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use object_store::RetryConfig;
+use openssl::{
+    ecdsa::EcdsaSig,
+    hash::{hash, MessageDigest},
+    nid::Nid,
+    pkey::{Id, PKey, Private},
+    sign::Signer,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use tokio::sync::Mutex;
@@ -231,7 +242,9 @@ pub(crate) struct SnowflakeDownloadData {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SnowflakeErrorData {
-    query_id: String
+    #[serde(default)]
+    query_id: String,
+    request_id: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -278,6 +291,196 @@ struct SnowflakeStatusResponse {
     data: SnowflakeStatusData
 }
 
+struct JwtSigningAlgorithm {
+    name: &'static str,
+    digest: MessageDigest,
+    ec_signature_component_len: Option<usize>,
+}
+
+struct SnowflakeJwtSigner {
+    account: String,
+    username: String,
+    private_key_path: String,
+}
+
+impl SnowflakeJwtSigner {
+    fn new(account: impl Into<String>, username: impl Into<String>, private_key_path: impl Into<String>) -> Self {
+        SnowflakeJwtSigner {
+            account: account.into(),
+            username: username.into(),
+            private_key_path: private_key_path.into(),
+        }
+    }
+
+    fn normalize_account(account: &str) -> String {
+        let account = if account.contains(".global") {
+            account
+                .split_once('-')
+                .map(|(partition, _)| partition)
+                .unwrap_or(account)
+        } else {
+            account
+                .split_once('.')
+                .map(|(partition, _)| partition)
+                .unwrap_or(account)
+        };
+
+        account.to_uppercase()
+    }
+
+    fn load_private_key(&self) -> crate::Result<PKey<Private>> {
+        let key_bytes = std::fs::read(&self.private_key_path)
+            .map_err(Error::invalid_config_err("Unable to access Snowflake private key file"))?;
+
+        if let Ok(key) = PKey::private_key_from_pem(&key_bytes) {
+            return Ok(key);
+        }
+
+        if let Ok(key) = PKey::private_key_from_der(&key_bytes) {
+            return Ok(key);
+        }
+
+        if let Ok(key_text) = std::str::from_utf8(&key_bytes) {
+            let encoded_key: String = key_text.chars().filter(|c| !c.is_whitespace()).collect();
+            if let Ok(der_key) = STANDARD.decode(encoded_key.as_bytes()) {
+                if let Ok(key) = PKey::private_key_from_der(&der_key) {
+                    return Ok(key);
+                }
+            }
+        }
+
+        Err(Error::invalid_config(
+            "Failed to load Snowflake private key; expected unencrypted PEM, DER, or base64-encoded DER"
+        ))
+    }
+
+    fn signing_algorithm(key: &PKey<Private>) -> crate::Result<JwtSigningAlgorithm> {
+        match key.id() {
+            Id::RSA => Ok(JwtSigningAlgorithm {
+                name: "RS256",
+                digest: MessageDigest::sha256(),
+                ec_signature_component_len: None,
+            }),
+            Id::EC => {
+                let ec_key = key
+                    .ec_key()
+                    .map_err(Error::invalid_config_err("Failed to inspect Snowflake EC private key"))?;
+                let curve = ec_key
+                    .group()
+                    .curve_name()
+                    .ok_or_else(|| Error::invalid_config("Snowflake EC private key is missing curve information"))?;
+
+                match curve {
+                    Nid::X9_62_PRIME256V1 => Ok(JwtSigningAlgorithm {
+                        name: "ES256",
+                        digest: MessageDigest::sha256(),
+                        ec_signature_component_len: Some(32),
+                    }),
+                    Nid::SECP384R1 => Ok(JwtSigningAlgorithm {
+                        name: "ES384",
+                        digest: MessageDigest::sha384(),
+                        ec_signature_component_len: Some(48),
+                    }),
+                    Nid::SECP521R1 => Ok(JwtSigningAlgorithm {
+                        name: "ES512",
+                        digest: MessageDigest::sha512(),
+                        ec_signature_component_len: Some(66),
+                    }),
+                    _ => Err(Error::invalid_config(
+                        "Unsupported Snowflake EC private key curve; expected P-256, P-384, or P-521",
+                    )),
+                }
+            }
+            _ => Err(Error::invalid_config(
+                "Unsupported Snowflake private key type; expected RSA or ECDSA",
+            )),
+        }
+    }
+
+    fn left_pad_signature_component(component: &[u8], target_len: usize) -> crate::Result<Vec<u8>> {
+        if component.len() > target_len {
+            return Err(Error::invalid_config(
+                "Snowflake ECDSA signature component is larger than expected for its curve",
+            ));
+        }
+
+        let mut padded = vec![0; target_len];
+        padded[target_len - component.len()..].copy_from_slice(component);
+        Ok(padded)
+    }
+
+    fn jwt_signature(
+        signing_input: &str,
+        key: &PKey<Private>,
+        algorithm: &JwtSigningAlgorithm,
+    ) -> crate::Result<Vec<u8>> {
+        let mut signer = Signer::new(algorithm.digest, key)
+            .map_err(Error::invalid_config_err("Failed to initialize Snowflake private key signer"))?;
+        signer
+            .update(signing_input.as_bytes())
+            .map_err(Error::invalid_config_err("Failed to sign Snowflake JWT"))?;
+        let signature = signer
+            .sign_to_vec()
+            .map_err(Error::invalid_config_err("Failed to sign Snowflake JWT"))?;
+
+        if let Some(component_len) = algorithm.ec_signature_component_len {
+            let signature = EcdsaSig::from_der(&signature)
+                .map_err(Error::invalid_config_err("Failed to convert Snowflake ECDSA signature"))?;
+            let r = Self::left_pad_signature_component(&signature.r().to_vec(), component_len)?;
+            let s = Self::left_pad_signature_component(&signature.s().to_vec(), component_len)?;
+            Ok([r, s].concat())
+        } else {
+            Ok(signature)
+        }
+    }
+
+    fn token(&self) -> crate::Result<String> {
+        let key = self.load_private_key()?;
+        let public_key_der = key
+            .public_key_to_der()
+            .map_err(Error::invalid_config_err("Failed to derive Snowflake public key"))?;
+        let public_key_digest = hash(MessageDigest::sha256(), &public_key_der)
+            .map_err(Error::invalid_config_err("Failed to hash Snowflake public key"))?;
+        let public_key_fp = format!("SHA256:{}", STANDARD.encode(public_key_digest));
+
+        let account = Self::normalize_account(&self.account);
+        let username = self.username.to_uppercase();
+        let subject = format!("{account}.{username}");
+        let issuer = format!("{subject}.{public_key_fp}");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(Error::invalid_config_err("Failed to calculate Snowflake JWT issue time"))?
+            .as_secs();
+        let algorithm = Self::signing_algorithm(&key)?;
+
+        let header = serde_json::to_vec(&serde_json::json!({
+            "alg": algorithm.name,
+            "typ": "JWT",
+        }))
+        .map_err(Error::invalid_config_err("Failed to encode Snowflake JWT header"))?;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "iss": issuer,
+            "sub": subject,
+            "iat": now,
+            "exp": now + 60,
+        }))
+        .map_err(Error::invalid_config_err("Failed to encode Snowflake JWT payload"))?;
+
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(payload)
+        );
+        let signature = Self::jwt_signature(&signing_input, &key, &algorithm)?;
+
+        Ok(format!(
+            "{}.{}",
+            signing_input,
+            URL_SAFE_NO_PAD.encode(signature)
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SnowflakeClientConfig {
     pub account: String,
@@ -287,6 +490,8 @@ pub(crate) struct SnowflakeClientConfig {
     pub warehouse: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub pat_token: Option<String>,
+    pub private_key_path: Option<String>,
     pub role: Option<String>,
     pub master_token_path: Option<String>,
     pub stage_info_cache_ttl: Option<Duration>,
@@ -306,6 +511,8 @@ impl SnowflakeClientConfig {
             warehouse: env::var("SNOWFLAKE_WAREHOUSE").ok(),
             username: env::var("SNOWFLAKE_USERNAME").ok(),
             password: env::var("SNOWFLAKE_PASSWORD").ok(),
+            pat_token: env::var("SNOWFLAKE_PAT_TOKEN").ok(),
+            private_key_path: env::var("SNOWFLAKE_PRIVATE_KEY_PATH").ok(),
             role: env::var("SNOWFLAKE_ROLE").ok(),
             master_token_path: env::var("MASTER_TOKEN_PATH").ok(),
             stage_info_cache_ttl: None,
@@ -386,6 +593,7 @@ impl SnowflakeClient {
     pub(crate) fn from_env() -> anyhow::Result<Arc<SnowflakeClient>> {
         Ok(SnowflakeClient::new(SnowflakeClientConfig::from_env()?))
     }
+
     async fn heartbeat(&self) -> crate::Result<bool> {
         let token = {
             let locked = self.token.lock().await;
@@ -466,7 +674,45 @@ impl SnowflakeClient {
             }
         } else {
             let _guard = duration_on_drop!(metrics::sf_token_login_duration);
-            let response = if let (Some(username), Some(password)) = (&config.username, &config.password) {
+            let response = if let Some(pat_token) = &config.pat_token {
+                // Programmatic Access Token Login
+                let username = config
+                    .username
+                    .as_ref()
+                    .ok_or_else(|| Error::invalid_config("PAT authentication requires `snowflake_username`"))?;
+                let mut qs = vec![
+                    ("accountName", &config.account),
+                    ("databaseName", &config.database),
+                    ("schemaName", &config.schema),
+                ];
+
+                if let Some(warehouse) = config.warehouse.as_ref() {
+                    qs.push(("warehouse", warehouse));
+                }
+
+                if let Some(role) = config.role.as_ref() {
+                    qs.push(("roleName", role));
+                }
+
+                let data = serde_json::json!({
+                    "ACCOUNT_NAME": &config.account,
+                    "AUTHENTICATOR": "PROGRAMMATIC_ACCESS_TOKEN",
+                    "LOGIN_NAME": username,
+                    "TOKEN": pat_token
+                });
+
+                let response = self.client.post(format!("{}/session/v1/login-request", config.endpoint))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/snowflake")
+                    .query(&qs)
+                    .json(&serde_json::json!({
+                        "data": data
+                    }))
+                    .send()
+                    .await?;
+
+                response
+            } else if let (Some(username), Some(password)) = (&config.username, &config.password) {
                 // User Password Login
                 let mut qs = vec![
                     ("accountName", &config.account),
@@ -492,6 +738,51 @@ impl SnowflakeClient {
                             "LOGIN_NAME": username,
                             "ACCOUNT_NAME": &config.account,
                             "AUTHENTICATOR": "USERNAME_PASSWORD_MFA"
+                        }
+                    }))
+                    .send()
+                    .await?;
+
+                response
+            } else if let Some(private_key_path) = &config.private_key_path {
+                // Private Key Login
+                let username = config
+                    .username
+                    .as_ref()
+                    .ok_or_else(|| Error::required_config("snowflake_username"))?;
+                let signer = SnowflakeJwtSigner::new(
+                    config.account.clone(),
+                    username.clone(),
+                    private_key_path.clone(),
+                );
+                let jwt_token = signer.token()?;
+
+                let mut qs = vec![
+                    ("accountName", &config.account),
+                    ("databaseName", &config.database),
+                    ("schemaName", &config.schema),
+                ];
+
+                if let Some(warehouse) = config.warehouse.as_ref() {
+                    qs.push(("warehouse", warehouse));
+                }
+
+                if let Some(role) = config.role.as_ref() {
+                    qs.push(("roleName", role));
+                }
+
+                let response = self
+                    .client
+                    .post(format!("{}/session/v1/login-request", config.endpoint))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/snowflake")
+                    .query(&qs)
+                    .json(&serde_json::json!({
+                        "data": {
+                            "LOGIN_NAME": username,
+                            "ACCOUNT_NAME": &config.account,
+                            "AUTHENTICATOR": "SNOWFLAKE_JWT",
+                            "TOKEN": jwt_token
                         }
                     }))
                     .send()
@@ -679,8 +970,92 @@ mod tests {
     use super::*;
     // use futures_util::StreamExt;
     use ::metrics::Unit;
+    use openssl::{
+        ec::{EcGroup, EcKey},
+        pkey::PKey,
+        rsa::Rsa,
+        sign::Verifier,
+    };
     use metrics_util::debugging::Snapshot;
     use object_store::path::Path;
+
+    fn temp_key_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("object_store_ffi_snowflake_key_{}.pem", uuid::Uuid::new_v4()))
+    }
+
+    fn jwt_parts(token: &str) -> anyhow::Result<(serde_json::Value, serde_json::Value, Vec<u8>, String)> {
+        let parts = token.split('.').collect::<Vec<_>>();
+        anyhow::ensure!(parts.len() == 3, "expected three JWT segments");
+
+        let header = URL_SAFE_NO_PAD.decode(parts[0])?;
+        let payload = URL_SAFE_NO_PAD.decode(parts[1])?;
+        let signature = URL_SAFE_NO_PAD.decode(parts[2])?;
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+        Ok((
+            serde_json::from_slice(&header)?,
+            serde_json::from_slice(&payload)?,
+            signature,
+            signing_input,
+        ))
+    }
+
+    #[test]
+    fn snowflake_jwt_signer_generates_valid_rsa_jwt() -> anyhow::Result<()> {
+        let private_key = Rsa::generate(2048)?;
+        let pkey = PKey::from_rsa(private_key)?;
+        let key_path = temp_key_path();
+        std::fs::write(&key_path, pkey.private_key_to_pem_pkcs8()?)?;
+
+        let signer = SnowflakeJwtSigner::new(
+            "acct-region.global",
+            "test_user",
+            key_path.to_string_lossy().into_owned(),
+        );
+        let token = signer.token()?;
+        let (header, payload, signature, signing_input) = jwt_parts(&token)?;
+
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(header["typ"], "JWT");
+        assert_eq!(payload["sub"], "ACCT.TEST_USER");
+        assert!(payload["iss"].as_str().unwrap().starts_with("ACCT.TEST_USER.SHA256:"));
+        assert_eq!(payload["exp"].as_u64().unwrap() - payload["iat"].as_u64().unwrap(), 60);
+
+        let mut verifier = Verifier::new(MessageDigest::sha256(), &pkey)?;
+        verifier.update(signing_input.as_bytes())?;
+        assert!(verifier.verify(&signature)?);
+
+        std::fs::remove_file(key_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn snowflake_jwt_signer_reads_key_file_each_time() -> anyhow::Result<()> {
+        let rsa_key = PKey::from_rsa(Rsa::generate(2048)?)?;
+        let key_path = temp_key_path();
+        std::fs::write(&key_path, rsa_key.private_key_to_pem_pkcs8()?)?;
+
+        let signer = SnowflakeJwtSigner::new(
+            "acct.region",
+            "test_user",
+            key_path.to_string_lossy().into_owned(),
+        );
+        let first_token = signer.token()?;
+        let (first_header, _, _, _) = jwt_parts(&first_token)?;
+        assert_eq!(first_header["alg"], "RS256");
+
+        let ec_group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let ec_key = PKey::from_ec_key(EcKey::generate(&ec_group)?)?;
+        std::fs::write(&key_path, ec_key.private_key_to_der()?)?;
+
+        let second_token = signer.token()?;
+        let (second_header, _, signature, _) = jwt_parts(&second_token)?;
+        assert_eq!(second_header["alg"], "ES256");
+        assert_eq!(signature.len(), 64);
+
+        std::fs::remove_file(key_path)?;
+        Ok(())
+    }
 
     fn format_unit(unit: Option<Unit>, v: f64) -> String {
         match unit {

@@ -1,4 +1,4 @@
-use crate::{duration_on_drop, encryption::{ContentCryptoMaterial, CryptoMaterialProvider, CryptoScheme, EncryptedKey, Iv, Key}, error::{Error, ErrorExt}, metrics, snowflake::SnowflakeClient, util::{deserialize_str, required_attribute}};
+use crate::{duration_on_drop, encryption::{CipherType, ContentCryptoMaterial, CryptoMaterialProvider, CryptoScheme, EncryptedKey, Iv, Key}, error::{Error, ErrorExt}, metrics, snowflake::SnowflakeClient, util::{deserialize_str, optional_attribute, required_attribute}};
 use ::metrics::counter;
 use crate::error::Kind as ErrorKind;
 
@@ -19,7 +19,7 @@ pub(crate) struct MaterialDescription {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SnowflakeStageKmsConfig {
-    pub crypto_scheme: CryptoScheme,
+    pub cipher_type: CipherType,
     pub keyring_capacity: usize,
     pub keyring_ttl: std::time::Duration
 }
@@ -27,7 +27,7 @@ pub(crate) struct SnowflakeStageKmsConfig {
 impl Default for SnowflakeStageKmsConfig {
     fn default() -> Self {
         SnowflakeStageKmsConfig {
-            crypto_scheme: CryptoScheme::Aes128Cbc,
+            cipher_type: CipherType::AesCbc,
             keyring_capacity: 100_000,
             // We keep the ttl at 10 minutes to preserve the SF TSS guarantee
             // that data cannot be decrypted after this period if the customer
@@ -77,6 +77,15 @@ impl SnowflakeStageS3Kms {
     }
 }
 
+fn scheme_from_cipher_type_and_key_len(cipher_type: CipherType, master_key_len: usize) -> crate::Result<CryptoScheme> {
+    match cipher_type {
+        CipherType::AesGcm if master_key_len == 32 => Ok(CryptoScheme::Aes256Gcm),
+        CipherType::AesCbc if master_key_len == 16 => Ok(CryptoScheme::Aes128Cbc),
+        CipherType::AesCbc if master_key_len == 32 => Ok(CryptoScheme::Aes256Cbc),
+        typ => Err(Error::not_implemented(format!("invalid combination of cipher type {:?} and master key size {}", typ, master_key_len)))
+    }
+}
+
 #[async_trait::async_trait]
 impl CryptoMaterialProvider for SnowflakeStageS3Kms {
     async fn material_for_write(&self, _path: &str, data_len: Option<usize>) -> crate::Result<(ContentCryptoMaterial, Attributes)> {
@@ -88,7 +97,7 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
         let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
             .map_err(ErrorKind::MaterialDecode)?;
 
-        let scheme = self.config.crypto_scheme;
+        let scheme = scheme_from_cipher_type_and_key_len(self.config.cipher_type, master_key.len())?;
         let description = MaterialDescription {
             smk_id: encryption_material.smk_id.to_string(),
             query_id: encryption_material.query_id.clone(),
@@ -157,8 +166,9 @@ impl CryptoMaterialProvider for SnowflakeStageS3Kms {
             .map_err(ErrorKind::MaterialCrypt)?;
         let iv = Iv::from_base64(required_attribute(&attr, "x-amz-iv")?)
             .map_err(ErrorKind::MaterialDecode)?;
+
         // The attribute may be absent for older writes; treat that as CBC.
-        let cek_alg = required_attribute(&attr, "x-amz-cek-alg").ok();
+        let cek_alg = optional_attribute(&attr, "x-amz-cek-alg");
 
         let scheme = s3_content_scheme(cek_alg, cek.len())?;
 
@@ -233,7 +243,8 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
         let master_key = Key::from_base64(&encryption_material.query_stage_master_key)
             .map_err(ErrorKind::MaterialDecode)?;
 
-        let scheme = self.config.crypto_scheme;
+        let scheme = scheme_from_cipher_type_and_key_len(self.config.cipher_type, master_key.len())?;
+
         let description = MaterialDescription {
             smk_id: encryption_material.smk_id.to_string(),
             query_id: encryption_material.query_id.clone(),
@@ -256,6 +267,8 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             },
             encryption_agent: EncryptionAgent {
                 protocol: "1.0".to_string(),
+                // The warehouse always emits AES_CBC_256, the go driver always emits AES_CBC_128,
+                // we emit the actual crypto scheme in use.
                 encryption_algorithm: match scheme {
                     CryptoScheme::Aes128Cbc => "AES_CBC_128".to_string(),
                     CryptoScheme::Aes256Cbc => "AES_CBC_256".to_string(),
@@ -305,7 +318,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             &self.keyring,
         ).await?;
 
-        let encryption_data: EncryptionData = 
+        let encryption_data: EncryptionData =
             deserialize_str(required_attribute(&attr, AZURE_ENCDATA_KEY)?)
             .map_err(Error::deserialize_response_err("failed to deserialize encryption data"))?;
 
@@ -327,7 +340,7 @@ impl CryptoMaterialProvider for SnowflakeStageAzureKms {
             iv,
             aad: None,
         };
-        
+
         Ok(content_material)
     }
 }
