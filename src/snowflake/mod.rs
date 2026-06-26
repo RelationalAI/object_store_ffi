@@ -1,4 +1,4 @@
-use crate::{clients, encryption::{CryptoMaterialProvider, CryptoScheme}, error::{Error, ErrorExt, Kind as ErrorKind}, CResult, Client, ClientExtension, Context, Extension, NotifyGuard, RawConfig, RawResponse, ResponseGuard};
+use crate::{clients, encryption::{CipherType, CryptoMaterialProvider}, error::{Error, ErrorExt, Kind as ErrorKind}, CResult, Client, ClientExtension, Context, Extension, NotifyGuard, RawConfig, RawResponse, ResponseGuard};
 use crate::{RT, with_cancellation};
 
 pub(crate) mod client;
@@ -325,11 +325,10 @@ pub(crate) fn validate_config_for_snowflake(map: &mut HashMap<String, String>, r
 
     let kms_config = if let Some(scheme_str) = map.remove("snowflake_encryption_scheme") {
         Some(SnowflakeStageKmsConfig {
-           crypto_scheme: match scheme_str.as_str() {
-                "AES_256_GCM" => CryptoScheme::Aes256Gcm,
-                "AES_128_CBC" => CryptoScheme::Aes128Cbc,
-                "AES_256_CBC" => CryptoScheme::Aes256Cbc,
-                _ => return Err(Error::invalid_config("Invalid value for snowflake_encryption_scheme").into()),
+           cipher_type: match scheme_str.as_str() {
+                "AES_256_GCM" | "AES_GCM" => CipherType::AesGcm,
+                "AES_128_CBC" | "AES_256_CBC" | "AES_CBC" => CipherType::AesCbc,
+                v => return Err(Error::invalid_config(format!("Invalid value for snowflake_encryption_scheme: {v}"))),
            },
            keyring_capacity: match map.remove("snowflake_keyring_capacity").map(|s| s.parse::<usize>()) {
                Some(Ok(cap)) => cap,
@@ -374,6 +373,18 @@ pub(crate) async fn build_store_for_snowflake_stage(
     let config = validate_config_for_snowflake(&mut config_map, retry_config.clone())?;
     let client = SnowflakeClient::new(config.client_config);
     let info = client.current_upload_info(&config.stage).await?;
+
+    if let Some(kms_config) = &config.kms_config {
+        match (info.stage_info.ciphers.as_deref(), kms_config.cipher_type) {
+            (Some("AES_CBC"), CipherType::AesCbc) => (),
+            (Some("AES_GCM"), CipherType::AesGcm) => (),
+            (stage_cipher, requested_cipher) => {
+                return Err(Error::invalid_config(
+                    format!("Stage cipher {:?} does not match requested cipher ({:?})", stage_cipher, requested_cipher)
+                ).into());
+            }
+        }
+    }
 
     match info.stage_info.location_type.as_ref() {
         "S3" => {

@@ -242,7 +242,9 @@ pub(crate) struct SnowflakeDownloadData {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SnowflakeErrorData {
-    query_id: String
+    #[serde(default)]
+    query_id: String,
+    request_id: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
