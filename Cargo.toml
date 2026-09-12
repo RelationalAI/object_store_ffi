@@ -34,7 +34,7 @@ julia = []
 sfcp = ["clap"]
 
 [dependencies]
-tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1.38.2", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 bytes = "1.0"
 tracing = "0.1"
